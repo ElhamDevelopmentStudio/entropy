@@ -30,6 +30,10 @@ Environment variables available:
 - `HDCF_HEARTBEAT_TIMEOUT_SECONDS` (default `60`)
 - `HDCF_RECONCILE_INTERVAL_SECONDS` (default `10`)
 - `HDCF_CLEANUP_INTERVAL_SECONDS` (default `300`)
+- `HDCF_QUEUE_AGING_WINDOW_SECONDS` (default `0`)
+- `HDCF_MAX_RETRY_CONCURRENCY_PER_WORKER` (default `0`)
+- `HDCF_PREEMPT_HIGH_PRIORITY_BACKLOG_THRESHOLD` (default `0`)
+- `HDCF_PREEMPT_HIGH_PRIORITY_FLOOR` (default `0`)
 - `HDCF_JOBS_RETENTION_COMPLETED_DAYS` (default `30`)
 - `HDCF_ARTIFACTS_RETENTION_DAYS` (default `14`)
 - `HDCF_EVENTS_RETENTION_DAYS` (default `30`)
@@ -45,6 +49,12 @@ Control-plane cleanup controls:
 - `-tls-cert`, `-tls-key` (start HTTPS control plane)
 - `-tls-client-ca` (optional CA for optional client cert validation)
 - `-tls-require-client-cert` (require and verify worker client certs)
+
+Scheduling controls:
+- `-queue-aging-window-seconds` (fairness age bonus window in seconds)
+- `-max-retry-concurrency-per-worker` (max concurrent retry jobs per worker; `0` means unlimited)
+- `-preempt-high-priority-backlog-threshold` (gates lower-priority jobs when high-priority backlog is high)
+- `-preempt-high-priority-floor` (priority threshold used during preemption mode)
 
 ### 2) Start worker on ASUS
 
@@ -71,6 +81,8 @@ Worker options:
 - `-log-retention-days` (default `30`)
 - `-log-cleanup-interval-seconds` (default `300`)
 - `-heartbeat-metrics` (default `false`) — include optional resource metrics in heartbeat payload
+- `-artifact-storage-backend` (default `local`) — artifact destination strategy (`local`, `nfs`, `s3`)
+- `-artifact-storage-location` (required for `nfs` backend) — storage path for non-local artifact backends
 - `-command-allowlist` (default `false`) — enable command allowlist enforcement
 - `-allowed-commands` (default ``) — comma-separated command allowlist when `-command-allowlist` is on
 - `-allowed-working-dirs` (default ``) — comma-separated list of allowed working directories
@@ -90,6 +102,8 @@ Environment variables:
 - `HDCF_WORKER_ALLOWED_WORKING_DIRS` (comma-separated working directory allowlist)
 - `HDCF_WORKER_REQUIRE_NON_ROOT` (`true` to block root execution)
 - `HDCF_WORKER_DRY_RUN` (`true` for simulated execution)
+- `HDCF_ARTIFACT_STORAGE_BACKEND` (default `local`; values: `local`, `nfs`, `s3`)
+- `HDCF_ARTIFACT_STORAGE_LOCATION` (required for `nfs` backend)
 - `HDCF_TLS_CA` (ca bundle for control-plane cert)
 - `HDCF_TLS_CLIENT_CERT` (client cert for mTLS)
 - `HDCF_TLS_CLIENT_KEY` (client key for mTLS)
@@ -119,7 +133,7 @@ Retention and cleanup behavior:
   - emit cleanup audit events (`control.cleanup*`) with counts and deletion outcomes.
 - Worker retains log/artifact files locally and periodically removes old artifacts via `log-retention-days`.
 
-### 3) Submit a job
+### 3) Submit and inspect jobs with `hdcfctl`
 
 ```bash
 go run ./cmd/hdcfctl submit \
@@ -135,6 +149,55 @@ The CLI sends `POST /jobs` and returns the new `job_id`.
 Optional scheduling fields:
 - `--priority` (higher value = higher queue priority)
 - `--scheduled-at` (unix seconds timestamp when job becomes eligible; `0` means now)
+
+List jobs:
+
+```bash
+go run ./cmd/hdcfctl jobs list --status=PENDING
+```
+
+Show one job:
+
+```bash
+go run ./cmd/hdcfctl jobs describe <job_id>
+```
+
+List workers:
+
+```bash
+go run ./cmd/hdcfctl workers list
+```
+
+Abort a job:
+
+```bash
+go run ./cmd/hdcfctl abort --job-id <job_id> --reason "no longer needed"
+```
+
+Invoke reconnect replay manually:
+
+```bash
+go run ./cmd/hdcfctl replay --worker-id worker-1
+go run ./cmd/hdcfctl replay --worker-id worker-1 --completed-jobs-file /tmp/reconnect.json
+```
+
+Example `reconnect.json` payload:
+
+```json
+[
+  {
+    "job_id": "00000000-0000-0000-0000-000000000000",
+    "assignment_id": "assign-123",
+    "completion_seq": 1,
+    "artifact_id": "a1",
+    "status": "COMPLETED",
+    "exit_code": 0,
+    "stdout_path": "/tmp/stdout.txt",
+    "stderr_path": "/tmp/stderr.txt",
+    "result_summary": "manual replay"
+  }
+]
+```
 
 Advanced scheduling fields are accepted directly by the API as part of `POST /jobs`:
 - `needs_gpu` (`true`/`false`)
@@ -157,9 +220,14 @@ Advanced scheduling fields are accepted directly by the API as part of `POST /jo
 - `POST /fail`
 - `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `since_id`, `limit`)  
   `since_id` returns only events with `id > since_id` for incremental polling.
+- `POST /reconnect` supports optional `current_job_id` and completed-job replay payload, and can now be manually invoked via `hdcfctl replay`.
 
 Queue ordering behavior:
 - `GET /next-job` claims from `PENDING` jobs by descending `priority`, then ascending `created_at`, then ascending `job_id`.
+- Optional scheduling controls:
+  - `-queue-aging-window-seconds` boosts older low-priority work over time to improve fairness.
+  - `-preempt-high-priority-backlog-threshold` and `-preempt-high-priority-floor` can temporarily prioritize higher-priority backlog.
+  - `-max-retry-concurrency-per-worker` limits retry job assignment pressure per worker.
 - Jobs with `scheduled_at` in the future are not claimed until their scheduled time arrives.
 
 Read/observability behavior:
@@ -188,6 +256,7 @@ Completion safety behavior:
 - `POST /complete` and `POST /fail` require `assignment_id` and only apply when it matches the job's current lease.
 - `POST /complete` requires artifact contract fields (`artifact_id`, `stdout_path`, `stderr_path`, `stdout_tmp_path`, `stderr_tmp_path`).
 - `POST /complete` stores artifact metadata in SQLite and rejects completion when artifact fields are incomplete or violate the temp/final naming contract.
+- `POST /complete` also stores artifact abstraction metadata (`artifact_backend`, `artifact_location`, `artifact_upload_state`, `artifact_upload_error`).
 - On success, worker computes and reports SHA-256 checksums for stdout/stderr artifacts; the control plane persists them in job records.
 - `/complete` and `/fail` are idempotent for terminal states (`COMPLETED`/`FAILED`) and return success without state changes.
 - To avoid out-of-order mutation, worker heartbeats and completions now include monotonic sequence numbers:
@@ -231,7 +300,8 @@ Tables:
     `attempt_count`, `max_attempts`, `worker_id`, `assignment_id`, `assignment_expires_at`, `last_error`, `result_path`,
     `artifact_id`, `artifact_stdout_tmp_path`, `artifact_stdout_path`,
     `artifact_stdout_sha256`, `artifact_stderr_tmp_path`, `artifact_stderr_path`,
-    `artifact_stderr_sha256`, `updated_by`
+    `artifact_stderr_sha256`, `artifact_storage_backend`, `artifact_storage_location`,
+    `artifact_upload_state`, `artifact_upload_error`, `updated_by`
 - `workers`:
   - `worker_id`, `last_seen`, `current_job_id`, `status`, `registered_at`, `registration_nonce`, `worker_capabilities`
 - `audit_events`:

@@ -110,7 +110,7 @@ Acceptance criteria:
   - `-require-non-root` (`HDCF_WORKER_REQUIRE_NON_ROOT`)
   - `-dry-run` (`HDCF_WORKER_DRY_RUN`)
 
-6. `[ ]` P5-06 — Better reconnection model and idempotency across all endpoints
+6. `[x]` P5-06 — Better reconnection model and idempotency across all endpoints
 Current status: completion/fail heartbeat sequencing already implemented
 Target: store + control endpoints
 Implementation tasks:
@@ -119,7 +119,7 @@ Implementation tasks:
 Acceptance criteria:
 - Repeated retriable HTTP calls never fork duplicate side effects.
 
-7. `[ ]` P5-07 — Priority and preemption policy upgrades
+7. `[x]` P5-07 — Priority and preemption policy upgrades
 Current status: fixed single-dimensional priority ordering exists
 Target: scheduling layer in `internal/store/store.go`
 Implementation tasks:
@@ -129,18 +129,25 @@ Implementation tasks:
 - Add explicit preemption settings (e.g. max high-priority backlog threshold).
 Acceptance criteria:
 - Mixed workloads remain fair and predictable across multiple workers.
+Progress:
+- Added scheduling policy knobs for queue aging, preemptive high-priority backlog gating, and worker retry concurrency in control-plane scheduling path.
 
-8. `[ ]` P5-08 — Artifact storage abstraction
-Current status: filesystem temp/final paths on worker host only
+8. `[x]` P5-08 — Artifact storage abstraction
+Current status: worker uploads artifacts using selectable backend
 Target: worker + control plane API
 Implementation tasks:
 - Define artifact storage strategy enum: local, NFS share, or S3-compatible object store.
 - Add upload progress/error metadata in completion payload.
 Acceptance criteria:
 - Retry semantics remain consistent regardless of storage backend.
+Progress:
+- Implemented local-file and NFS artifact upload strategy via worker + request payload metadata.
+- Added artifact storage backend/type metadata propagation (`artifact_storage_backend`, `artifact_storage_location`, upload state/error) through `/complete` and reconnect paths.
+- Added API/docs/config updates for worker backend selection (`-artifact-storage-backend`, `-artifact-storage-location`, env vars).
+- S3 is not yet implemented at runtime but schema and protocol fields are already in place for future extension.
 
-9. `[ ]` P5-09 — Operational CLI enhancements
-Current status: only `submit` exists
+9. `[x]` P5-09 — Operational CLI enhancements
+Current status: complete operational CLI surface implemented
 Target: `cmd/hdcfctl`
 Implementation tasks:
 - `jobs` list/filter CLI
@@ -150,6 +157,10 @@ Implementation tasks:
 - `replay` command for manually invoking reconnect flow.
 Acceptance criteria:
 - Common admin operations available without raw `curl`.
+Progress:
+- Added CLI subcommands: `jobs list`, `jobs describe`, `workers list`, `abort`, and `replay`.
+- Added `--url`/`--token` flags across commands and JSON output for list/describe/abort/reconnect responses.
+- Added reconnect replay payload support via `--completed-jobs-file` in `replay`.
 
 10. `[ ]` P5-10 — Integration test suite
 Current status: no automated CI test harness yet
