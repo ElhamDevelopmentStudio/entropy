@@ -276,7 +276,7 @@ Progress:
 - Added completion sequence tracking via `jobs.completion_seq`.
   `/complete` ignores stale/reordered duplicate completion messages and persists the latest completion sequence per job.
 
-17. `[ ]` P3-17 — Add resource-metric heartbeat payload support (optional MVP field)
+17. `[x]` P3-17 — Add resource-metric heartbeat payload support (optional MVP field)
 Requirement source: `SRS.md` Section 4.2
 Target: `internal/hdcf/types.go`, `cmd/worker/main.go`, `cmd/control/main.go`
 Implementation details:
@@ -285,8 +285,13 @@ Store metrics only when provided.
 Acceptance criteria:
 Metrics ingestion does not break current protocol.
 Dependency: P9-10.
+Progress:
+- Added heartbeat metrics payload type (`cpu_usage_percent`, `memory_usage_mb`, `gpu_usage_percent`, `gpu_memory_usage_mb`) with optional fields.
+- Worker heartbeat loop now optionally sends metrics (`-heartbeat-metrics`) with runtime memory usage.
+- Control-plane persistence captures heartbeat metrics into `workers.heartbeat_metrics` only when at least one metric is provided.
+- `GET /workers` now returns latest heartbeat metrics via optional `heartbeat_metrics` payload.
 
-18. `[ ]` P3-18 — Add test scenarios from SRS Section 7
+18. `[x]` P3-18 — Add test scenarios from SRS Section 7
 Requirement source: `SRS.md` Section 7
 Target: repository test plan + future scripts
 Implementation details:
@@ -299,6 +304,10 @@ duplicate completion replay
 Acceptance criteria:
 All listed recovery conditions pass and state remains consistent.
 Dependency: all high-priority protocol and recovery work.
+Progress:
+- Added `SRS_TEST_SCENARIOS.md` with detailed manual + automated validation steps for all Section 7 scenarios.
+- Added `scripts/reliability-scenarios.sh` with helper endpoints and a duplicate-completion replay command path.
+- Included expected recovery outcomes and event-based checkpoints for manual router drop, worker kill, worker power-cycle, CP restart, and replay-safe completion checks.
 
 ## Future extension items (after SRS minimum)
 

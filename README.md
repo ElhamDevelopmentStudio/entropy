@@ -40,6 +40,7 @@ Worker options:
 - `-heartbeat-interval-seconds` (default `5`)
 - `-request-timeout-seconds` (default `10`)
 - `-log-dir` (default `worker-logs`)
+- `-heartbeat-metrics` (default `false`) — include optional resource metrics in heartbeat payload
 
 Environment variables:
 
@@ -94,7 +95,7 @@ Read/observability behavior:
 
 - `GET /jobs` returns job list entries with state, timestamps, attempt counters, worker assignment, and heartbeat age for jobs with active workers.
 - `GET /jobs/{job_id}` returns a single job detail payload with the same fields.
-- `GET /workers` returns worker rows with heartbeat age in seconds.
+- `GET /workers` returns worker rows with heartbeat age in seconds and optional latest `heartbeat_metrics`.
 - `GET /events` returns durable control-plane structured events (filtered by component/event/worker/job with a default descending order and configurable limit).  
   Use this as the primary recovery audit trail before touching the database directly.
 
@@ -170,6 +171,11 @@ Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAIL
 ## SRS checklist
 
 - See `SRS_IMPLEMENTATION_CHECKLIST.md` for the full ordered implementation plan and progress tracking.
+
+## SRS recovery test scenarios
+
+- Section 7 scenarios from `SRS.md` are documented in `SRS_TEST_SCENARIOS.md`.
+- A helper script exists at `scripts/reliability-scenarios.sh` for scenario status checks and duplicate-completion replay.
 
 ## Notes
 
