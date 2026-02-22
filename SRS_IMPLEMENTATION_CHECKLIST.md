@@ -215,7 +215,7 @@ Progress:
 - `GET /next-job` selects eligible `PENDING` jobs by `priority DESC`, then `created_at ASC`, then `id ASC`.
 - Added migration-safe defaults and queue index for deterministic ordering.
 
-13. `[ ]` P2-13 — Add worker capability metadata placeholders
+13. `[x]` P2-13 — Add worker capability metadata placeholders
 Requirement source: `SRS.md` Section 5.5
 Target: `internal/store/store.go`, `cmd/control/main.go`, `cmd/worker/main.go`
 Implementation details:
@@ -224,6 +224,14 @@ Filter candidate workers when selecting job.
 Acceptance criteria:
 Capability-aware assignment works without breaking default single-worker path.
 Dependency: P2-12.
+Progress:
+- Extended worker/job models and SQLite schema with capability metadata:
+  - `needs_gpu`, `requirements` (jobs)
+  - `worker_capabilities` (workers)
+- `/jobs` request/response now accepts and returns job requirements and GPU requirement.
+- `/register` accepts worker capability lists and persists them.
+- Worker startup parses `-capabilities`/`HDCF_WORKER_CAPABILITIES`.
+- `/next-job` claims only jobs matching the requesting worker’s capabilities.
 
 14. `[ ]` P2-14 — Buffer and batch log upload on reconnection
 Requirement source: `SRS.md` Section 4.3.1

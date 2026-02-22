@@ -81,6 +81,8 @@ type CreateJobRequest struct {
 	TimeoutMs   int64    `json:"timeout_ms"`
 	Priority    int      `json:"priority"`
 	ScheduledAt int64    `json:"scheduled_at"`
+	NeedsGPU    bool     `json:"needs_gpu"`
+	Requirements []string `json:"requirements"`
 }
 
 type CreateJobResponse struct {
@@ -111,6 +113,8 @@ type JobRead struct {
 	TimeoutMs          int64    `json:"timeout_ms"`
 	Priority           int      `json:"priority"`
 	ScheduledAt        int64    `json:"scheduled_at"`
+	NeedsGPU           bool     `json:"needs_gpu"`
+	Requirements       []string `json:"requirements"`
 	CreatedAt          int64    `json:"created_at"`
 	UpdatedAt          int64    `json:"updated_at"`
 	AttemptCount       int      `json:"attempt_count"`
@@ -141,6 +145,7 @@ type WorkerRead struct {
 	WorkerID          string `json:"worker_id"`
 	Status            string `json:"status"`
 	CurrentJobID      string `json:"current_job_id"`
+	Capabilities      []string `json:"capabilities"`
 	LastSeen          int64  `json:"last_seen"`
 	RegisteredAt      int64  `json:"registered_at"`
 	HeartbeatAgeSec   int64  `json:"heartbeat_age_sec"`
@@ -154,8 +159,9 @@ type HeartbeatRequest struct {
 }
 
 type RegisterWorkerRequest struct {
-	WorkerID string `json:"worker_id"`
-	Nonce    string `json:"nonce"`
+	WorkerID     string   `json:"worker_id"`
+	Nonce        string   `json:"nonce"`
+	Capabilities []string `json:"capabilities"`
 }
 
 type AckJobRequest struct {

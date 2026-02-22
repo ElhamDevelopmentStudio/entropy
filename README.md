@@ -35,10 +35,18 @@ Worker options:
 - `-control-url` (default `http://localhost:8080`)
 - `-worker-id` (default `hostname-<generated>`)
 - `-token` (default `dev-token`)
+- `-capabilities` (default ``, comma-separated worker capabilities, e.g. `gpu,ssd`)
 - `-poll-interval-seconds` (default `3`)
 - `-heartbeat-interval-seconds` (default `5`)
 - `-request-timeout-seconds` (default `10`)
 - `-log-dir` (default `worker-logs`)
+
+Environment variables:
+
+- `HDCF_WORKER_CAPABILITIES` (comma-separated capabilities)
+- `HDCF_WORKER_NONCE`
+- `HDCF_CONTROL_URL`
+- `HDCF_WORKER_ID`
 
 ### 3) Submit a job
 
@@ -56,6 +64,11 @@ The CLI sends `POST /jobs` and returns the new `job_id`.
 Optional scheduling fields:
 - `--priority` (higher value = higher queue priority)
 - `--scheduled-at` (unix seconds timestamp when job becomes eligible; `0` means now)
+
+Advanced scheduling fields are accepted directly by the API as part of `POST /jobs`:
+- `needs_gpu` (`true`/`false`)
+- `requirements` (string array)
+- `worker_capabilities` (on `POST /register`, via worker startup registration)
 
 ## Implemented endpoints
 
@@ -129,13 +142,14 @@ On startup, the control plane now performs one reconciliation sweep immediately 
 Tables:
 
 - `jobs`:
-  - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `priority`, `scheduled_at`, `created_at`, `updated_at`,
+  - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `priority`, `scheduled_at`, `needs_gpu`, `requirements`,
+    `created_at`, `updated_at`,
     `attempt_count`, `max_attempts`, `worker_id`, `assignment_id`, `assignment_expires_at`, `last_error`, `result_path`,
     `artifact_id`, `artifact_stdout_tmp_path`, `artifact_stdout_path`,
     `artifact_stdout_sha256`, `artifact_stderr_tmp_path`, `artifact_stderr_path`,
     `artifact_stderr_sha256`, `updated_by`
 - `workers`:
-  - `worker_id`, `last_seen`, `current_job_id`, `status`, `registered_at`, `registration_nonce`
+  - `worker_id`, `last_seen`, `current_job_id`, `status`, `registered_at`, `registration_nonce`, `worker_capabilities`
 
 Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAILED`, `LOST`, `RETRYING`, `ABORTED` (SRS-complete core state machine is in place; advanced lifecycle transitions are being implemented by checklist).
 

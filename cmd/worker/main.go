@@ -31,6 +31,7 @@ func main() {
 		controlURL:       strings.TrimRight(cfg.controlURL, "/"),
 		workerID:         cfg.workerID,
 		nonce:            cfg.nonce,
+		capabilities:     cfg.capabilities,
 		token:            cfg.token,
 		pollInterval:     cfg.pollInterval,
 		heartbeatInterval: cfg.heartbeatInterval,
@@ -64,6 +65,7 @@ type workerConfig struct {
 	controlURL        string
 	workerID          string
 	nonce             string
+	capabilities      []string
 	token             string
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
@@ -77,6 +79,7 @@ func parseWorkerConfig() workerConfig {
 	flag.StringVar(&cfg.controlURL, "control-url", getenv("HDCF_CONTROL_URL", "http://localhost:8080"), "control plane url")
 	flag.StringVar(&cfg.workerID, "worker-id", getenv("HDCF_WORKER_ID", ""), "worker id")
 	flag.StringVar(&cfg.nonce, "worker-nonce", getenv("HDCF_WORKER_NONCE", ""), "optional registration nonce")
+	capabilities := flag.String("capabilities", getenv("HDCF_WORKER_CAPABILITIES", ""), "comma-separated worker capabilities")
 	flag.StringVar(&cfg.token, "token", getenv("HDCF_API_TOKEN", "dev-token"), "api token")
 	var pollSec int
 	var heartbeatSec int
@@ -98,6 +101,7 @@ func parseWorkerConfig() workerConfig {
 	if strings.TrimSpace(cfg.stateFile) == "" {
 		cfg.stateFile = filepath.Join(cfg.logDir, "worker-state.json")
 	}
+	cfg.capabilities = splitCapabilities(*capabilities)
 	return cfg
 }
 
@@ -109,10 +113,28 @@ func getenv(name, fallback string) string {
 	return v
 }
 
+func splitCapabilities(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
 type workerRunner struct {
 	controlURL        string
 	workerID          string
 	nonce             string
+	capabilities      []string
 	token             string
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
@@ -252,8 +274,9 @@ func (r *workerRunner) getCurrentJobID() *string {
 
 func (r *workerRunner) register(ctx context.Context) error {
 	req := hdcf.WorkerRegisterRequest{
-		WorkerID: r.workerID,
-		Nonce:    r.nonce,
+		WorkerID:     r.workerID,
+		Nonce:        r.nonce,
+		Capabilities: r.capabilities,
 	}
 	payload, _ := json.Marshal(req)
 	endpoint := fmt.Sprintf("%s/register", r.controlURL)
