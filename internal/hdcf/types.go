@@ -16,6 +16,13 @@ const (
 	StatusLost      = "LOST"
 	StatusRetrying  = "RETRYING"
 	StatusAborted   = "ABORTED"
+
+	ReconnectActionKeepCurrentJob  = "KEEP_CURRENT_JOB"
+	ReconnectActionClearCurrentJob = "CLEAR_CURRENT_JOB"
+	ReconnectActionReplayCompleted = "REPLAY_COMPLETED"
+	ReconnectActionReplayFailed    = "REPLAY_FAILED"
+	ReconnectResultAccepted       = "ACCEPTED"
+	ReconnectResultRejected       = "REJECTED"
 )
 
 var validTransitions = map[string]map[string]bool{
@@ -121,6 +128,7 @@ type AckJobRequest struct {
 type CompleteRequest struct {
 	JobID         string `json:"job_id"`
 	WorkerID      string `json:"worker_id"`
+	AssignmentID  string `json:"assignment_id"`
 	ExitCode      int    `json:"exit_code"`
 	StdoutPath    string `json:"stdout_path"`
 	StderrPath    string `json:"stderr_path"`
@@ -128,10 +136,41 @@ type CompleteRequest struct {
 }
 
 type FailRequest struct {
-	JobID    string `json:"job_id"`
-	WorkerID string `json:"worker_id"`
-	ExitCode int    `json:"exit_code"`
-	Error    string `json:"error"`
+	JobID       string `json:"job_id"`
+	WorkerID    string `json:"worker_id"`
+	AssignmentID string `json:"assignment_id"`
+	ExitCode    int    `json:"exit_code"`
+	Error       string `json:"error"`
+}
+
+type ReconnectCompletedJob struct {
+	JobID         string `json:"job_id"`
+	AssignmentID  string `json:"assignment_id"`
+	Status        string `json:"status"`
+	ExitCode      int    `json:"exit_code"`
+	StdoutPath    string `json:"stdout_path"`
+	StderrPath    string `json:"stderr_path"`
+	ResultSummary string `json:"result_summary"`
+	Error         string `json:"error"`
+}
+
+type WorkerReconnectRequest struct {
+	WorkerID      string                  `json:"worker_id"`
+	CurrentJobID  *string                 `json:"current_job_id"`
+	CompletedJobs []ReconnectCompletedJob  `json:"completed_jobs"`
+}
+
+type ReconnectAction struct {
+	JobID        string `json:"job_id"`
+	AssignmentID string `json:"assignment_id"`
+	Action       string `json:"action"`
+	Result       string `json:"result"`
+	Error        string `json:"error,omitempty"`
+}
+
+type WorkerReconnectResponse struct {
+	Status  string            `json:"status"`
+	Actions []ReconnectAction `json:"actions"`
 }
 
 func IsValidStatus(status string) bool {

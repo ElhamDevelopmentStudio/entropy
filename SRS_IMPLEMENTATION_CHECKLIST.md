@@ -90,7 +90,7 @@ Worker disappearance does not leave active jobs orphaned.
 Lost jobs are recoverable and do not duplicate unexpectedly.
 Dependency: P1-01, P1-02.
 
-4. `[ ]` P1-04 — Make completion/failure idempotent and conflict-safe
+4. `[x]` P1-04 — Make completion/failure idempotent and conflict-safe
 Requirement source: `SRS.md` Section 4.6, 6 failure matrix
 Target: `internal/store/store.go`, `cmd/control/main.go`
 Implementation details:
@@ -102,7 +102,7 @@ Duplicate completion messages from reconnects are safe and deterministic.
 A completed job never reverts to non-terminal state.
 Dependency: P1-01.
 
-5. `[ ]` P1-05 — Add worker reconnection protocol and startup reporting
+5. `[x]` P1-05 — Add worker reconnection protocol and startup reporting
 Requirement source: `SRS.md` Section 4.6, 4.4.1
 Target: `cmd/worker/main.go`, `cmd/control/main.go`, `internal/store/store.go`
 Implementation details:

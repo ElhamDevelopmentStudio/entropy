@@ -36,6 +36,7 @@ func main() {
 	mux.HandleFunc("/next-job", withAuth(cfg.apiToken, nextJob(s)))
 	mux.HandleFunc("/ack", withAuth(cfg.apiToken, ackJob(s)))
 	mux.HandleFunc("/heartbeat", withAuth(cfg.apiToken, heartbeat(s)))
+	mux.HandleFunc("/reconnect", withAuth(cfg.apiToken, reconnectWorker(s)))
 	mux.HandleFunc("/complete", withAuth(cfg.apiToken, completeJob(s)))
 	mux.HandleFunc("/fail", withAuth(cfg.apiToken, failJob(s)))
 
@@ -184,6 +185,32 @@ func heartbeat(s *store.Store) http.HandlerFunc {
 	}
 }
 
+func reconnectWorker(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req hdcf.WorkerReconnectRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			return
+		}
+		if strings.TrimSpace(req.WorkerID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
+			return
+		}
+		actions, err := s.ReconnectWorker(r.Context(), req)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, hdcf.WorkerReconnectResponse{
+			Status:  "ok",
+			Actions: actions,
+		})
+	}
+}
+
 func completeJob(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -194,8 +221,8 @@ func completeJob(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id and worker_id required"})
+		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.AssignmentID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
 			return
 		}
 		if err := s.CompleteJob(r.Context(), req); err != nil {
@@ -216,8 +243,8 @@ func failJob(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id and worker_id required"})
+		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.AssignmentID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
 			return
 		}
 		if err := s.FailJob(r.Context(), req); err != nil {

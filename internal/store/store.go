@@ -326,6 +326,196 @@ func (s *Store) AcknowledgeJob(ctx context.Context, req hdcf.AckJobRequest) erro
 	return tx.Commit()
 }
 
+func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectRequest) ([]hdcf.ReconnectAction, error) {
+	if strings.TrimSpace(req.WorkerID) == "" {
+		return nil, fmt.Errorf("worker_id required")
+	}
+
+	actions := make([]hdcf.ReconnectAction, 0, 4+len(req.CompletedJobs))
+
+	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var currentJob interface{}
+	currentJobID := ""
+	if req.CurrentJobID != nil {
+		currentJobID = strings.TrimSpace(*req.CurrentJobID)
+	}
+	if currentJobID != "" {
+		currentJob = currentJobID
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO workers (worker_id, last_seen, current_job_id, status)
+		 VALUES (?, ?, ?, 'ONLINE')
+		 ON CONFLICT(worker_id) DO UPDATE SET
+		   last_seen = excluded.last_seen,
+		   current_job_id = excluded.current_job_id,
+		   status = 'ONLINE'`,
+		req.WorkerID,
+		now,
+		currentJob,
+	); err != nil {
+		return nil, err
+	}
+
+	if currentJobID != "" {
+		var status, owner sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT status, worker_id FROM jobs WHERE id = ?`, currentJobID).Scan(&status, &owner)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			actions = append(actions, hdcf.ReconnectAction{
+				JobID:   currentJobID,
+				Action:  hdcf.ReconnectActionClearCurrentJob,
+				Result:  hdcf.ReconnectResultAccepted,
+				Error:   "job not found",
+			})
+			if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, req.WorkerID); err != nil {
+				return nil, err
+			}
+		} else {
+			ownerID := strings.TrimSpace(owner.String)
+			switch status.String {
+			case hdcf.StatusRunning:
+				if ownerID == req.WorkerID {
+					actions = append(actions, hdcf.ReconnectAction{
+						JobID:  currentJobID,
+						Action: hdcf.ReconnectActionKeepCurrentJob,
+						Result: hdcf.ReconnectResultAccepted,
+					})
+				} else {
+					if _, err := tx.ExecContext(
+						ctx,
+						`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, updated_by = 'reconnect', updated_at = ? WHERE id = ? AND status = ?`,
+						hdcf.StatusLost,
+						now,
+						currentJobID,
+						hdcf.StatusRunning,
+					); err != nil {
+						return nil, err
+					}
+					actions = append(actions, hdcf.ReconnectAction{
+						JobID:  currentJobID,
+						Action: hdcf.ReconnectActionClearCurrentJob,
+						Result: hdcf.ReconnectResultAccepted,
+						Error:   "ownership mismatch",
+					})
+					if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, req.WorkerID); err != nil {
+						return nil, err
+					}
+				}
+			case hdcf.StatusAssigned:
+				if ownerID == req.WorkerID {
+					actions = append(actions, hdcf.ReconnectAction{
+						JobID:  currentJobID,
+						Action: hdcf.ReconnectActionKeepCurrentJob,
+						Result: hdcf.ReconnectResultAccepted,
+					})
+				} else {
+					if _, err := tx.ExecContext(
+						ctx,
+						`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, updated_by = 'reconnect', updated_at = ? WHERE id = ? AND status = ?`,
+						hdcf.StatusPending,
+						now,
+						currentJobID,
+						hdcf.StatusAssigned,
+					); err != nil {
+						return nil, err
+					}
+					actions = append(actions, hdcf.ReconnectAction{
+						JobID:  currentJobID,
+						Action: hdcf.ReconnectActionClearCurrentJob,
+						Result: hdcf.ReconnectResultAccepted,
+						Error:   "ownership mismatch",
+					})
+					if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, req.WorkerID); err != nil {
+						return nil, err
+					}
+				}
+			default:
+				actions = append(actions, hdcf.ReconnectAction{
+					JobID:  currentJobID,
+					Action: hdcf.ReconnectActionClearCurrentJob,
+					Result: hdcf.ReconnectResultAccepted,
+				})
+				if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, req.WorkerID); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	for _, completed := range req.CompletedJobs {
+		jobID := strings.TrimSpace(completed.JobID)
+		assignmentID := strings.TrimSpace(completed.AssignmentID)
+		replay := hdcf.ReconnectAction{
+			JobID:        jobID,
+			AssignmentID: assignmentID,
+		}
+		if jobID == "" {
+			replay.Result = hdcf.ReconnectResultRejected
+			replay.Error = "job_id required"
+			actions = append(actions, replay)
+			continue
+		}
+
+		switch strings.ToUpper(strings.TrimSpace(completed.Status)) {
+		case hdcf.StatusCompleted:
+			replay.Action = hdcf.ReconnectActionReplayCompleted
+			err := s.CompleteJob(ctx, hdcf.CompleteRequest{
+				JobID:        jobID,
+				WorkerID:     req.WorkerID,
+				AssignmentID: assignmentID,
+				ExitCode:     completed.ExitCode,
+				StdoutPath:   completed.StdoutPath,
+				StderrPath:   completed.StderrPath,
+				ResultSummary: completed.ResultSummary,
+			})
+			if err != nil {
+				replay.Result = hdcf.ReconnectResultRejected
+				replay.Error = err.Error()
+			} else {
+				replay.Result = hdcf.ReconnectResultAccepted
+			}
+		case hdcf.StatusFailed:
+			replay.Action = hdcf.ReconnectActionReplayFailed
+			err := s.FailJob(ctx, hdcf.FailRequest{
+				JobID:       jobID,
+				WorkerID:    req.WorkerID,
+				AssignmentID: assignmentID,
+				ExitCode:    completed.ExitCode,
+				Error:       completed.Error,
+			})
+			if err != nil {
+				replay.Result = hdcf.ReconnectResultRejected
+				replay.Error = err.Error()
+			} else {
+				replay.Result = hdcf.ReconnectResultAccepted
+			}
+		default:
+			replay.Action = hdcf.ReconnectActionReplayFailed
+			replay.Result = hdcf.ReconnectResultRejected
+			replay.Error = "unsupported completion status"
+		}
+		actions = append(actions, replay)
+	}
+
+	return actions, nil
+}
+
 func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) error {
 	now := time.Now().Unix()
 	var currentJob interface{}
@@ -358,10 +548,9 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	}
 	defer tx.Rollback()
 
-	var status, workerID, lastError, resultPath sql.NullString
-	var errScan error
-	errScan = tx.QueryRowContext(ctx, `SELECT status, worker_id, last_error, result_path FROM jobs WHERE id = ?`, req.JobID).
-		Scan(&status, &workerID, &lastError, &resultPath)
+	var status, workerID, assignmentID, lastError, resultPath sql.NullString
+	errScan := tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id, last_error, result_path FROM jobs WHERE id = ?`, req.JobID).
+		Scan(&status, &workerID, &assignmentID, &lastError, &resultPath)
 	if errScan != nil {
 		if errors.Is(errScan, sql.ErrNoRows) {
 			return fmt.Errorf("job not found")
@@ -371,22 +560,31 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	if status.String == hdcf.StatusCompleted {
 		return tx.Commit()
 	}
+	if status.String == hdcf.StatusFailed {
+		return tx.Commit()
+	}
 	if status.String != hdcf.StatusRunning {
 		return fmt.Errorf("job state not completable: %s", status.String)
 	}
 	if !hdcf.IsValidTransition(status.String, hdcf.StatusCompleted) {
 		return fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusCompleted)
 	}
-	if strings.TrimSpace(req.WorkerID) != "" && !workerID.Valid && status.String == hdcf.StatusPending {
+	if workerID.Valid && workerID.String != req.WorkerID {
 		return fmt.Errorf("job worker mismatch for completion")
 	}
-	if strings.TrimSpace(req.WorkerID) != "" && workerID.Valid && workerID.String != req.WorkerID {
-		return fmt.Errorf("job worker mismatch for completion")
+	if strings.TrimSpace(req.AssignmentID) == "" {
+		return fmt.Errorf("assignment_id required")
+	}
+	if !assignmentID.Valid || assignmentID.String == "" {
+		return fmt.Errorf("assignment not found")
+	}
+	if strings.TrimSpace(req.AssignmentID) != assignmentID.String {
+		return fmt.Errorf("assignment_id mismatch")
 	}
 
 	_, err = tx.ExecContext(
 		ctx,
-		`UPDATE jobs SET status = ?, worker_id = NULL, result_path = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+		`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, result_path = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
 		hdcf.StatusCompleted,
 		req.StdoutPath,
 		req.ResultSummary,
@@ -409,10 +607,10 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 	}
 	defer tx.Rollback()
 
-	var status, workerID sql.NullString
+	var status, workerID, assignmentID sql.NullString
 	var attemptCount, maxAttempts int
-	if err := tx.QueryRowContext(ctx, `SELECT status, worker_id, attempt_count, max_attempts FROM jobs WHERE id = ?`, req.JobID).
-		Scan(&status, &workerID, &attemptCount, &maxAttempts); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id, attempt_count, max_attempts FROM jobs WHERE id = ?`, req.JobID).
+		Scan(&status, &workerID, &assignmentID, &attemptCount, &maxAttempts); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("job not found")
 		}
@@ -433,6 +631,15 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 	if strings.TrimSpace(req.WorkerID) != "" && workerID.Valid && workerID.String != req.WorkerID {
 		return fmt.Errorf("job worker mismatch for failure")
 	}
+	if strings.TrimSpace(req.AssignmentID) == "" {
+		return fmt.Errorf("assignment_id required")
+	}
+	if !assignmentID.Valid || assignmentID.String == "" {
+		return fmt.Errorf("assignment not found")
+	}
+	if strings.TrimSpace(req.AssignmentID) != assignmentID.String {
+		return fmt.Errorf("assignment_id mismatch")
+	}
 
 	nextStatus := hdcf.StatusFailed
 	if attemptCount < maxAttempts {
@@ -441,7 +648,7 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 
 	_, err = tx.ExecContext(
 		ctx,
-		`UPDATE jobs SET status = ?, worker_id = NULL, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+		`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
 		nextStatus,
 		req.Error,
 		time.Now().Unix(),

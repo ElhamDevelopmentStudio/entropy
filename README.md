@@ -58,6 +58,7 @@ The CLI sends `POST /jobs` and returns the new `job_id`.
 - `GET /next-job?worker_id=...`
 - `POST /ack`
 - `POST /heartbeat`
+- `POST /reconnect`
 - `POST /complete`
 - `POST /fail`
 
@@ -67,6 +68,24 @@ ACK flow behavior:
 - Worker must call `/ack` before executing with `job_id`, `worker_id`, and `assignment_id`.
 - `/ack` transitions job from `ASSIGNED` to `RUNNING`.
 - Reconciler returns stale assignments (`ASSIGNED` with expired `assignment_expires_at`) to `PENDING`.
+
+Completion safety behavior:
+
+- `POST /complete` and `POST /fail` require `assignment_id` and only apply when it matches the job's current lease.
+- `/complete` and `/fail` are idempotent for terminal states (`COMPLETED`/`FAILED`) and return success without state changes.
+
+Reconnection behavior:
+
+- `POST /reconnect` is sent by workers on startup and accepts:
+  - `worker_id`
+  - optional `current_job_id`
+  - optional list of recently completed jobs (`job_id`, `assignment_id`, status and completion details)
+- Control plane reconciles `current_job_id` and applies reconnection completion replay.
+- Worker removes replayed completed jobs from its local recovery state after an accepted action.
+
+Worker startup options:
+
+- `-state-file` (default `<log-dir>/worker-state.json`) for persisted reconnect replay data.
 
 ## Data model
 
