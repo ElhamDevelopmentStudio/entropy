@@ -156,6 +156,7 @@ type HeartbeatRequest struct {
 	WorkerID     string  `json:"worker_id"`
 	CurrentJobID *string `json:"current_job_id"`
 	Timestamp    string  `json:"ts"`
+	Sequence     int64   `json:"seq"`
 }
 
 type RegisterWorkerRequest struct {
@@ -183,6 +184,7 @@ type CompleteRequest struct {
 	StdoutSHA256  string `json:"stdout_sha256"`
 	StderrSHA256  string `json:"stderr_sha256"`
 	ResultSummary string `json:"result_summary"`
+	CompletionSeq int64  `json:"completion_seq"`
 }
 
 type FailRequest struct {
@@ -202,6 +204,7 @@ type AbortRequest struct {
 type ReconnectCompletedJob struct {
 	JobID         string `json:"job_id"`
 	AssignmentID  string `json:"assignment_id"`
+	CompletionSeq int64  `json:"completion_seq"`
 	ArtifactID    string `json:"artifact_id"`
 	Status        string `json:"status"`
 	ExitCode      int    `json:"exit_code"`
@@ -232,6 +235,18 @@ type ReconnectAction struct {
 type WorkerReconnectResponse struct {
 	Status  string            `json:"status"`
 	Actions []ReconnectAction `json:"actions"`
+}
+
+type AuditEvent struct {
+	ID        int64                  `json:"id"`
+	Timestamp int64                  `json:"ts"`
+	Component string                 `json:"component"`
+	Level     string                 `json:"level"`
+	Event     string                 `json:"event"`
+	RequestID string                 `json:"request_id,omitempty"`
+	WorkerID  string                 `json:"worker_id,omitempty"`
+	JobID     string                 `json:"job_id,omitempty"`
+	Details   map[string]interface{} `json:"details"`
 }
 
 func IsValidStatus(status string) bool {

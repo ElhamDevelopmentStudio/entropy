@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/hex"
-	"errors"
 	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -52,11 +52,35 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := runner.register(ctx); err != nil {
-		log.Printf("worker registration failed: %v", err)
+		workerEvent("warn", "worker.register", map[string]any{
+			"worker_id": cfg.workerID,
+			"action":    "initial",
+			"error":     err.Error(),
+		})
+	} else {
+		workerEvent("info", "worker.register", map[string]any{
+			"worker_id": cfg.workerID,
+			"action":    "initial",
+			"status":    "ok",
+		})
 	}
 	if err := runner.reconnect(ctx); err != nil {
-		log.Printf("startup reconnect failed: %v", err)
+		workerEvent("warn", "worker.reconnect", map[string]any{
+			"worker_id": cfg.workerID,
+			"scope":     "startup",
+			"error":     err.Error(),
+		})
+	} else {
+		workerEvent("info", "worker.reconnect", map[string]any{
+			"worker_id": cfg.workerID,
+			"scope":     "startup",
+			"status":    "ok",
+		})
 	}
+	workerEvent("info", "worker.loop_start", map[string]any{
+		"worker_id":        cfg.workerID,
+		"control_endpoint": strings.TrimRight(cfg.controlURL, "/"),
+	})
 	go runner.heartbeatLoop(ctx)
 
 	runner.loop(ctx)
@@ -145,12 +169,16 @@ type workerRunner struct {
 	currentJobID      atomic.Value
 	httpClient        *http.Client
 	stateMu           sync.Mutex
+	heartbeatSeq      int64
+	completionSeq     int64
 }
 
 type workerReconnectState struct {
 	CurrentJobID      string                     `json:"current_job_id"`
 	CurrentAssignmentID string                    `json:"current_assignment_id"`
 	CompletedJobs     []hdcf.ReconnectCompletedJob `json:"completed_jobs"`
+	HeartbeatSeq      int64                      `json:"heartbeat_seq"`
+	LastCompletionSeq int64                      `json:"last_completion_seq"`
 }
 
 func (r *workerRunner) loop(ctx context.Context) {
@@ -162,40 +190,85 @@ func (r *workerRunner) loop(ctx context.Context) {
 		default:
 		}
 
+		workerEvent("debug", "worker.loop_cycle", map[string]any{
+			"worker_id": r.workerID,
+			"backoff_ms": backoff.Milliseconds(),
+		})
 		if err := r.register(ctx); err != nil {
-			log.Printf("worker registration failed: %v", err)
+			workerEvent("warn", "worker.register", map[string]any{
+				"worker_id": r.workerID,
+				"action":    "loop",
+				"error":     err.Error(),
+			})
 			time.Sleep(backoff)
 			backoff = nextBackoff(backoff, 30*time.Second)
 			continue
 		}
+		workerEvent("debug", "worker.register", map[string]any{
+			"worker_id": r.workerID,
+			"action":    "loop",
+			"status":    "ok",
+		})
 
 		job, err := r.nextJob(ctx)
 		if err != nil {
-			log.Printf("next-job: %v", err)
+			workerEvent("warn", "worker.next_job", map[string]any{
+				"worker_id": r.workerID,
+				"error":     err.Error(),
+			})
 			time.Sleep(backoff)
 			backoff = nextBackoff(backoff, 30*time.Second)
 			continue
 		}
 		if job == nil {
+			workerEvent("debug", "worker.next_job", map[string]any{
+				"worker_id": r.workerID,
+				"status":    "no_job",
+			})
 			time.Sleep(jitterDuration(r.pollInterval))
 			backoff = r.pollInterval
 			continue
 		}
+		workerEvent("info", "worker.next_job", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"attempt_count": job.AttemptCount,
+			"command":       job.Command,
+		})
 		if err := r.ackJob(ctx, job); err != nil {
-			log.Printf("ack-job %s: %v", job.JobID, err)
+			workerEvent("warn", "worker.ack_job", map[string]any{
+				"worker_id":     r.workerID,
+				"job_id":        job.JobID,
+				"assignment_id": job.AssignmentID,
+				"error":         err.Error(),
+			})
 			time.Sleep(backoff)
 			backoff = nextBackoff(backoff, 30*time.Second)
 			continue
 		}
+		workerEvent("info", "worker.ack_job", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+		})
 
 		if err := r.setCurrentReconnectState(job.JobID, job.AssignmentID); err != nil {
-			log.Printf("save current job %s: %v", job.JobID, err)
+			workerEvent("warn", "worker.state_persist", map[string]any{
+				"worker_id": r.workerID,
+				"job_id":    job.JobID,
+				"error":     err.Error(),
+			})
 		}
 		r.currentJobID.Store(job.JobID)
 		r.executeJob(ctx, job)
 		r.currentJobID.Store("")
 		if err := r.clearCurrentReconnectState(); err != nil {
-			log.Printf("clear current job: %v", err)
+			workerEvent("warn", "worker.state_persist", map[string]any{
+				"worker_id": r.workerID,
+				"current_job_id": "",
+				"error":     err.Error(),
+			})
 		}
 		backoff = r.pollInterval
 	}
@@ -209,17 +282,38 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			workerEvent("debug", "worker.heartbeat_cycle", map[string]any{
+				"worker_id": r.workerID,
+			})
 			if err := r.register(ctx); err != nil {
-				log.Printf("worker registration failed: %v", err)
+				workerEvent("warn", "worker.register", map[string]any{
+					"worker_id": r.workerID,
+					"action":    "heartbeat",
+					"error":     err.Error(),
+				})
 				continue
 			}
 			current := r.getCurrentJobID()
 			if err := r.sendHeartbeat(ctx, current); err != nil {
-				log.Printf("heartbeat failed: %v", err)
+				workerEvent("warn", "worker.heartbeat", map[string]any{
+					"worker_id": r.workerID,
+					"error":     err.Error(),
+				})
 				continue
 			}
+			workerEvent("info", "worker.heartbeat", map[string]any{
+				"worker_id":  r.workerID,
+				"current_job_id": current,
+			})
 			if err := r.flushPendingReconnectResults(ctx); err != nil {
-				log.Printf("pending reconnect flush failed: %v", err)
+				workerEvent("warn", "worker.reconnect_flush", map[string]any{
+					"worker_id": r.workerID,
+					"error":     err.Error(),
+				})
+			} else {
+				workerEvent("debug", "worker.reconnect_flush", map[string]any{
+					"worker_id": r.workerID,
+				})
 			}
 			ticker.Reset(jitterDuration(r.heartbeatInterval))
 		}
@@ -231,6 +325,14 @@ func (r *workerRunner) reconnect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	r.heartbeatSeq = state.HeartbeatSeq
+	r.completionSeq = state.LastCompletionSeq
+	workerEvent("info", "worker.reconnect", map[string]any{
+		"worker_id":      r.workerID,
+		"scope":          "startup",
+		"has_current_job": strings.TrimSpace(state.CurrentJobID) != "",
+		"pending_replays": len(state.CompletedJobs),
+	})
 
 	req := hdcf.WorkerReconnectRequest{
 		WorkerID:      r.workerID,
@@ -250,18 +352,41 @@ func (r *workerRunner) reconnect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	workerEvent("info", "worker.reconnect_response", map[string]any{
+		"worker_id":    r.workerID,
+		"status":       resp.Status,
+		"action_count": len(resp.Actions),
+	})
 
 	for _, action := range resp.Actions {
+		actionLog := map[string]any{
+			"worker_id":     r.workerID,
+			"action":        action.Action,
+			"job_id":        action.JobID,
+			"assignment_id": action.AssignmentID,
+			"result":        action.Result,
+		}
 		switch action.Action {
 		case hdcf.ReconnectActionClearCurrentJob:
+			actionLog["state_change"] = "current_job_clear"
 			if action.JobID == "" || action.JobID == state.CurrentJobID {
 				_ = r.clearCurrentReconnectState()
 			}
 		case hdcf.ReconnectActionReplayCompleted, hdcf.ReconnectActionReplayFailed:
+			actionLog["state_change"] = action.Action
 			if action.Result == hdcf.ReconnectResultAccepted {
 				_ = r.removeCompletedReconnectResult(action.JobID, action.AssignmentID)
+				actionLog["result_state"] = "removed_local_replay"
+			} else {
+				actionLog["result_state"] = "kept_local_replay"
 			}
+			if errMsg := action.Error; errMsg != "" {
+				actionLog["error"] = errMsg
+			}
+		default:
+			actionLog["state_change"] = "unknown"
 		}
+		workerEvent("debug", "worker.reconnect_action", actionLog)
 	}
 	return nil
 }
@@ -316,20 +441,38 @@ func (r *workerRunner) nextJob(ctx context.Context) (*hdcf.AssignedJob, error) {
 
 	if resp.StatusCode == http.StatusNoContent {
 		if err := r.flushPendingReconnectResults(ctx); err != nil {
+			workerEvent("warn", "worker.reconnect_flush", map[string]any{
+				"worker_id": r.workerID,
+				"scope":     "no_content_after_next_job",
+				"error":     err.Error(),
+			})
 			return nil, err
 		}
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		body := readLimitedBody(resp.Body)
+		workerEvent("warn", "worker.next_job", map[string]any{
+			"worker_id": r.workerID,
+			"status":    resp.Status,
+			"body":      body,
+		})
 		return nil, fmt.Errorf("next-job status=%s body=%s", resp.Status, body)
 	}
 	var job hdcf.AssignedJob
 	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		workerEvent("warn", "worker.next_job", map[string]any{
+			"worker_id": r.workerID,
+			"error":     err.Error(),
+		})
 		return nil, err
 	}
 	if err := r.flushPendingReconnectResults(ctx); err != nil {
-		log.Printf("pending reconnect flush failed after next-job: %v", err)
+		workerEvent("warn", "worker.reconnect_flush", map[string]any{
+			"worker_id": r.workerID,
+			"scope":     "post_next_job",
+			"error":     err.Error(),
+		})
 	}
 	return &job, nil
 }
@@ -342,16 +485,28 @@ func (r *workerRunner) ackJob(ctx context.Context, job *hdcf.AssignedJob) error 
 	}
 	payload, _ := json.Marshal(req)
 	endpoint := fmt.Sprintf("%s/ack", r.controlURL)
-	return retryWithBackoff(ctx, r.requestTimeout, func() error {
+	err := retryWithBackoff(ctx, r.requestTimeout, func() error {
 		return r.postJSON(ctx, endpoint, payload)
 	}, 8)
+	if err != nil {
+		workerEvent("warn", "worker.ack_job", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        req.JobID,
+			"assignment_id": req.AssignmentID,
+			"error":         err.Error(),
+		})
+		return err
+	}
+	return nil
 }
 
 func (r *workerRunner) sendHeartbeat(ctx context.Context, currentJobID *string) error {
+	seq := r.nextHeartbeatSeq()
 	body := hdcf.HeartbeatRequest{
 		WorkerID:     r.workerID,
 		CurrentJobID: currentJobID,
 		Timestamp:    time.Now().Format(time.RFC3339),
+		Sequence:     seq,
 	}
 	payload, _ := json.Marshal(body)
 	endpoint := fmt.Sprintf("%s/heartbeat", r.controlURL)
@@ -371,15 +526,78 @@ func (r *workerRunner) sendHeartbeat(ctx context.Context, currentJobID *string) 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body := readLimitedBody(resp.Body)
+		workerEvent("warn", "worker.heartbeat", map[string]any{
+			"worker_id": r.workerID,
+			"status":    resp.Status,
+			"body":      body,
+		})
 		return fmt.Errorf("heartbeat status=%s body=%s", resp.Status, body)
 	}
 	return nil
+}
+
+func (r *workerRunner) nextHeartbeatSeq() int64 {
+	next := atomic.AddInt64(&r.heartbeatSeq, 1)
+	if next < 1 {
+		next = 1
+		atomic.StoreInt64(&r.heartbeatSeq, next)
+	}
+	if err := r.persistSequenceState(next, atomic.LoadInt64(&r.completionSeq)); err != nil {
+		workerEvent("warn", "worker.sequence_persist", map[string]any{
+			"worker_id": r.workerID,
+			"scope":     "heartbeat_seq",
+			"error":     err.Error(),
+		})
+	}
+	return next
+}
+
+func (r *workerRunner) nextCompletionSeq() int64 {
+	next := atomic.AddInt64(&r.completionSeq, 1)
+	if next < 1 {
+		next = 1
+		atomic.StoreInt64(&r.completionSeq, next)
+	}
+	if err := r.persistSequenceState(atomic.LoadInt64(&r.heartbeatSeq), next); err != nil {
+		workerEvent("warn", "worker.sequence_persist", map[string]any{
+			"worker_id": r.workerID,
+			"scope":     "completion_seq",
+			"error":     err.Error(),
+		})
+	}
+	return next
+}
+
+func (r *workerRunner) persistSequenceState(heartbeatSeq, completionSeq int64) error {
+	if heartbeatSeq < 0 {
+		heartbeatSeq = 0
+	}
+	if completionSeq < 0 {
+		completionSeq = 0
+	}
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	state, err := r.loadReconnectState()
+	if err != nil {
+		return err
+	}
+	state.HeartbeatSeq = heartbeatSeq
+	state.LastCompletionSeq = completionSeq
+	return r.persistReconnectState(state)
 }
 
 func (r *workerRunner) reportComplete(ctx context.Context, req hdcf.CompleteRequest) error {
 	payload, _ := json.Marshal(req)
 	endpoint := fmt.Sprintf("%s/complete", r.controlURL)
 	if err := r.postJSON(ctx, endpoint, payload); err != nil {
+		workerEvent("warn", "worker.report_complete", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        req.JobID,
+			"assignment_id": req.AssignmentID,
+			"artifact_id":   req.ArtifactID,
+			"exit_code":     req.ExitCode,
+			"error":         err.Error(),
+		})
 		return err
 	}
 	return nil
@@ -389,6 +607,13 @@ func (r *workerRunner) reportFail(ctx context.Context, req hdcf.FailRequest) err
 	payload, _ := json.Marshal(req)
 	endpoint := fmt.Sprintf("%s/fail", r.controlURL)
 	if err := r.postJSON(ctx, endpoint, payload); err != nil {
+		workerEvent("warn", "worker.report_fail", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        req.JobID,
+			"assignment_id": req.AssignmentID,
+			"exit_code":     req.ExitCode,
+			"error":         err.Error(),
+		})
 		return err
 	}
 	return nil
@@ -409,8 +634,19 @@ func (r *workerRunner) postJSON(ctx context.Context, endpoint string, payload []
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body := readLimitedBody(resp.Body)
+		workerEvent("warn", "worker.http_request", map[string]any{
+			"worker_id": r.workerID,
+			"endpoint":  endpoint,
+			"status":    resp.Status,
+			"body":      body,
+		})
 		return fmt.Errorf("request status=%s body=%s", resp.Status, body)
 	}
+	workerEvent("debug", "worker.http_request", map[string]any{
+		"worker_id": r.workerID,
+		"endpoint":  endpoint,
+		"status":    resp.Status,
+	})
 	return nil
 }
 
@@ -430,19 +666,42 @@ func (r *workerRunner) postJSONWithResponse(ctx context.Context, endpoint string
 	req.Header.Set(authHeader, r.token)
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
+		workerEvent("warn", "worker.http_request", map[string]any{
+			"worker_id": r.workerID,
+			"endpoint":  endpoint,
+			"error":     err.Error(),
+		})
 		return zero, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body := readLimitedBody(resp.Body)
+		workerEvent("warn", "worker.http_request", map[string]any{
+			"worker_id": r.workerID,
+			"endpoint":  endpoint,
+			"status":    resp.Status,
+			"body":      body,
+		})
 		return zero, fmt.Errorf("request status=%s body=%s", resp.Status, body)
 	}
 
 	var parsed hdcf.WorkerReconnectResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		workerEvent("warn", "worker.http_request", map[string]any{
+			"worker_id": r.workerID,
+			"endpoint":  endpoint,
+			"status":    resp.Status,
+			"error":     err.Error(),
+		})
 		return zero, err
 	}
+	workerEvent("debug", "worker.http_request", map[string]any{
+		"worker_id": r.workerID,
+		"endpoint":  endpoint,
+		"status":    resp.Status,
+		"actions":   len(parsed.Actions),
+	})
 	return parsed, nil
 }
 
@@ -481,12 +740,28 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		cmd.Dir = job.WorkingDir
 	}
 
-	log.Printf("worker %s running job %s: %s", r.workerID, job.JobID, job.Command)
+	workerEvent("info", "worker.job_execute", map[string]any{
+		"worker_id":     r.workerID,
+		"job_id":        job.JobID,
+		"assignment_id": job.AssignmentID,
+		"command":       job.Command,
+		"attempt_count": job.AttemptCount,
+		"timeout_ms":    job.TimeoutMs,
+		"working_dir":   strings.TrimSpace(job.WorkingDir),
+		"state":         "starting",
+	})
 	err = cmd.Start()
 	if err != nil {
 		r.handleJobFailure(ctx, job, err)
 		return
 	}
+	workerEvent("info", "worker.job_execute", map[string]any{
+		"worker_id":     r.workerID,
+		"job_id":        job.JobID,
+		"assignment_id": job.AssignmentID,
+		"state":         "running",
+		"pid":           cmd.Process.Pid,
+	})
 
 	err = cmd.Wait()
 	exitCode := 0
@@ -498,6 +773,7 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			msg = "execution timeout"
 			exitCode = -1
 		}
+		completionSeq := r.nextCompletionSeq()
 		failReq := hdcf.FailRequest{
 			JobID:        job.JobID,
 			WorkerID:     r.workerID,
@@ -508,6 +784,7 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		reconnectEntry := hdcf.ReconnectCompletedJob{
 			JobID:        job.JobID,
 			AssignmentID:  job.AssignmentID,
+			CompletionSeq: completionSeq,
 			Status:       hdcf.StatusFailed,
 			ExitCode:     failReq.ExitCode,
 			StderrPath:   stderrTmpPath,
@@ -515,16 +792,39 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			Error:        msg,
 		}
 		if err := r.enqueueCompletedReconnectResult(reconnectEntry); err != nil {
-			log.Printf("record failed completion for job %s: %v", job.JobID, err)
+			workerEvent("warn", "worker.job_reconnect_queue", map[string]any{
+				"worker_id": r.workerID,
+				"job_id":    job.JobID,
+				"error":     err.Error(),
+				"action":    "enqueue_failure",
+			})
 		}
 		if retryWithBackoff(ctx, r.requestTimeout, func() error {
 			return r.reportFail(ctx, failReq)
 		}, 8) == nil {
-			log.Printf("reported fail for job %s", job.JobID)
+			workerEvent("info", "worker.job_reported_fail", map[string]any{
+				"worker_id":     r.workerID,
+				"job_id":        job.JobID,
+				"assignment_id": job.AssignmentID,
+				"exit_code":     failReq.ExitCode,
+				"error":         msg,
+			})
 			if err := r.removeCompletedReconnectResult(job.JobID, job.AssignmentID); err != nil {
-				log.Printf("clear failed completion for job %s: %v", job.JobID, err)
+				workerEvent("warn", "worker.job_reported_fail", map[string]any{
+					"worker_id": r.workerID,
+					"job_id":    job.JobID,
+					"error":     err.Error(),
+				})
 			}
 		}
+		workerEvent("info", "worker.job_execute", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"state":         "failed",
+			"exit_code":     exitCode,
+			"message":       msg,
+		})
 		return
 	}
 
@@ -556,6 +856,7 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 	duration := time.Since(start).Milliseconds()
 	summary := fmt.Sprintf("exit_code=0 duration_ms=%d", duration)
 	artifactID := hdcf.NewJobID()
+	completionSeq := r.nextCompletionSeq()
 	compReq := hdcf.CompleteRequest{
 		JobID:        job.JobID,
 		WorkerID:     r.workerID,
@@ -568,11 +869,13 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		StderrTmpPath: stderrTmpPath,
 		StdoutSHA256: stdoutSHA256,
 		StderrSHA256: stderrSHA256,
+		CompletionSeq: completionSeq,
 		ResultSummary: summary,
 	}
 	reconnectEntry := hdcf.ReconnectCompletedJob{
 		JobID:         job.JobID,
 		AssignmentID:   job.AssignmentID,
+		CompletionSeq: completionSeq,
 		Status:        hdcf.StatusCompleted,
 		ExitCode:      exitCode,
 		StdoutPath:    stdoutPath,
@@ -584,16 +887,52 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		StderrSHA256:  stderrSHA256,
 		ResultSummary: summary,
 	}
+	workerEvent("info", "worker.job_execute", map[string]any{
+		"worker_id":   r.workerID,
+		"job_id":      job.JobID,
+		"assignment_id": job.AssignmentID,
+		"state":       "ready_for_completion",
+		"duration_ms": duration,
+		"artifact_id": artifactID,
+		"stdout_sha256": stdoutSHA256,
+		"stderr_sha256": stderrSHA256,
+	})
 	if err := r.enqueueCompletedReconnectResult(reconnectEntry); err != nil {
-		log.Printf("record completion for job %s: %v", job.JobID, err)
+		workerEvent("warn", "worker.job_reconnect_queue", map[string]any{
+			"worker_id": r.workerID,
+			"job_id":    job.JobID,
+			"error":     err.Error(),
+			"action":    "enqueue_completion",
+		})
 	}
 	if retryWithBackoff(ctx, r.requestTimeout, func() error {
 		return r.reportComplete(ctx, compReq)
 	}, 8) == nil {
-		log.Printf("job %s completed", job.JobID)
+		workerEvent("info", "worker.job_completed", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"artifact_id":   artifactID,
+			"duration_ms":   duration,
+			"stdout_path":   stdoutPath,
+			"stderr_path":   stderrPath,
+			"exit_code":     exitCode,
+		})
 		if err := r.removeCompletedReconnectResult(job.JobID, job.AssignmentID); err != nil {
-			log.Printf("clear completion for job %s: %v", job.JobID, err)
+			workerEvent("warn", "worker.job_completed", map[string]any{
+				"worker_id": r.workerID,
+				"job_id":    job.JobID,
+				"error":     err.Error(),
+			})
 		}
+	} else {
+		workerEvent("warn", "worker.job_completed", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"artifact_id":   artifactID,
+			"error":         "report_complete_failed_after_retries",
+		})
 	}
 }
 
@@ -748,9 +1087,17 @@ func (r *workerRunner) flushPendingReconnectResults(ctx context.Context) error {
 		state, err := r.loadReconnectState()
 		r.stateMu.Unlock()
 		if err != nil {
+			workerEvent("warn", "worker.reconnect_flush", map[string]any{
+				"worker_id": r.workerID,
+				"error":     err.Error(),
+			})
 			return err
 		}
 		if len(state.CompletedJobs) == 0 {
+			workerEvent("debug", "worker.reconnect_flush", map[string]any{
+				"worker_id": r.workerID,
+				"status":    "empty_queue",
+			})
 			return nil
 		}
 
@@ -762,35 +1109,74 @@ func (r *workerRunner) flushPendingReconnectResults(ctx context.Context) error {
 			WorkerID:      r.workerID,
 			CompletedJobs: batch,
 		}
+		workerEvent("info", "worker.reconnect_flush", map[string]any{
+			"worker_id": r.workerID,
+			"batch":     len(batch),
+			"queued":    len(state.CompletedJobs),
+		})
 		resp, err := r.postJSONWithResponse(ctx, r.controlURL+"/reconnect", req)
 		if err != nil {
 			return err
 		}
 		removedAny := false
 		for _, action := range resp.Actions {
+			actionLog := map[string]any{
+				"worker_id":     r.workerID,
+				"action":        action.Action,
+				"job_id":        action.JobID,
+				"assignment_id": action.AssignmentID,
+				"result":        action.Result,
+			}
 			switch action.Action {
 			case hdcf.ReconnectActionReplayCompleted, hdcf.ReconnectActionReplayFailed:
 				if action.Result == hdcf.ReconnectResultAccepted {
 					if err := r.removeCompletedReconnectResult(action.JobID, action.AssignmentID); err != nil {
 						return err
 					}
+					actionLog["removed_local_queue"] = true
 					removedAny = true
+				} else {
+					actionLog["removed_local_queue"] = false
 				}
 			case hdcf.ReconnectActionClearCurrentJob:
 				if action.JobID == "" || action.JobID == strings.TrimSpace(state.CurrentJobID) {
 					if err := r.clearCurrentReconnectState(); err != nil {
 						return err
 					}
+					actionLog["current_job_cleared"] = true
 				}
 			}
+			if action.Error != "" {
+				actionLog["error"] = action.Error
+			}
+			workerEvent("debug", "worker.reconnect_flush_action", actionLog)
 		}
 		if !removedAny {
+			workerEvent("info", "worker.reconnect_flush", map[string]any{
+				"worker_id":       r.workerID,
+				"result":          "pending_replays_rejected",
+				"action_count":    len(resp.Actions),
+				"remaining_count":  len(state.CompletedJobs),
+			})
 			return nil
 		}
+		workerEvent("info", "worker.reconnect_flush", map[string]any{
+			"worker_id":    r.workerID,
+			"result":       "batch_accepted",
+			"removed_any":  true,
+			"action_count": len(resp.Actions),
+		})
 	}
 }
 
 func (r *workerRunner) handleJobFailure(ctx context.Context, job *hdcf.AssignedJob, err error) {
+	workerEvent("warn", "worker.job_local_failure", map[string]any{
+		"worker_id":     r.workerID,
+		"job_id":        job.JobID,
+		"assignment_id": job.AssignmentID,
+		"error":         err.Error(),
+	})
+	completionSeq := r.nextCompletionSeq()
 	failReq := hdcf.FailRequest{
 		JobID:       job.JobID,
 		WorkerID:    r.workerID,
@@ -801,20 +1187,43 @@ func (r *workerRunner) handleJobFailure(ctx context.Context, job *hdcf.AssignedJ
 	reconnectEntry := hdcf.ReconnectCompletedJob{
 		JobID:       failReq.JobID,
 		AssignmentID: failReq.AssignmentID,
+		CompletionSeq: completionSeq,
 		Status:      hdcf.StatusFailed,
 		ExitCode:    failReq.ExitCode,
 		Error:       failReq.Error,
 	}
 	if queueErr := r.enqueueCompletedReconnectResult(reconnectEntry); queueErr != nil {
-		log.Printf("record startup failure for job %s: %v", job.JobID, queueErr)
+		workerEvent("warn", "worker.job_reconnect_queue", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"action":        "enqueue_startup_failure",
+			"error":         queueErr.Error(),
+		})
 	}
 	if retryWithBackoff(ctx, r.requestTimeout, func() error {
 		return r.reportFail(ctx, failReq)
 	}, 8) == nil {
-		log.Printf("reported startup failure for job %s", job.JobID)
+		workerEvent("info", "worker.job_reported_fail", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"exit_code":     failReq.ExitCode,
+		})
 		if queueErr := r.removeCompletedReconnectResult(job.JobID, job.AssignmentID); queueErr != nil {
-			log.Printf("clear startup failure for job %s: %v", job.JobID, queueErr)
+			workerEvent("warn", "worker.job_reported_fail", map[string]any{
+				"worker_id": r.workerID,
+				"job_id":    job.JobID,
+				"error":     queueErr.Error(),
+			})
 		}
+	} else {
+		workerEvent("warn", "worker.job_reported_fail", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"error":         "report_fail_retries_exhausted",
+		})
 	}
 }
 
@@ -871,4 +1280,25 @@ func readLimitedBody(r io.Reader) string {
 	return strings.TrimSpace(string(buf[:n]))
 }
 
-const authHeader = "X-API-Token"
+const (
+	authHeader    = "X-API-Token"
+	auditComponent = "worker_daemon"
+)
+
+func workerEvent(level, event string, fields map[string]any) {
+	payload := map[string]any{
+		"ts":         time.Now().Format(time.RFC3339Nano),
+		"component":  auditComponent,
+		"level":      level,
+		"event":      event,
+	}
+	for k, v := range fields {
+		payload[k] = v
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("failed to marshal worker event: %v", err)
+		return
+	}
+	log.Printf("%s", string(raw))
+}
