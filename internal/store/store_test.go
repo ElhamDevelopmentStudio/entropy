@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,6 +132,74 @@ func TestFailAfterCompletionIsNoop(t *testing.T) {
 	}
 }
 
+func TestClaimNextJobConcurrentWorkersAreMutualExclusive(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	const (
+		jobCount    = 40
+		workerCount = 8
+	)
+
+	for i := 0; i < jobCount; i++ {
+		if _, err := s.CreateJob(ctx, hdcf.CreateJobRequest{
+			Command:     "sleep",
+			Args:        []string{"1"},
+			MaxAttempts: 1,
+		}); err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+	}
+	workers := make([]string, 0, workerCount)
+	for i := 0; i < workerCount; i++ {
+		workerID := "worker-" + strconv.Itoa(i)
+		if err := s.RegisterWorker(ctx, hdcf.RegisterWorkerRequest{WorkerID: workerID}); err != nil {
+			t.Fatalf("register worker %s: %v", workerID, err)
+		}
+		workers = append(workers, workerID)
+	}
+
+	assignmentByJob := make(map[string]string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr atomicError
+
+	for _, workerID := range workers {
+		workerID := workerID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				assigned, ok, err := s.ClaimNextJob(ctx, workerID)
+				if err != nil {
+					firstErr.set(err)
+					return
+				}
+				if !ok || assigned == nil {
+					return
+				}
+				mu.Lock()
+				if previous, exists := assignmentByJob[assigned.JobID]; exists {
+					firstErr.setf("job %s assigned to multiple workers: %s and %s", assigned.JobID, previous, workerID)
+					mu.Unlock()
+					return
+				}
+				assignmentByJob[assigned.JobID] = workerID
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := firstErr.get(); err != nil {
+		t.Fatalf("claim loop error: %v", err)
+	}
+	if len(assignmentByJob) != jobCount {
+		t.Fatalf("expected to claim all jobs, got %d of %d", len(assignmentByJob), jobCount)
+	}
+}
+
 func enqueueAndClaimJob(t *testing.T, s *Store, ctx context.Context) (string, string, string) {
 	t.Helper()
 	resp, err := s.CreateJob(ctx, hdcf.CreateJobRequest{
@@ -151,6 +222,32 @@ func enqueueAndClaimJob(t *testing.T, s *Store, ctx context.Context) (string, st
 		t.Fatal("no job assigned")
 	}
 	return resp.JobID, assigned.AssignmentID, workerID
+}
+
+type atomicError struct {
+	err error
+	mu  sync.Mutex
+}
+
+func (e *atomicError) set(err error) {
+	if err == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.err == nil {
+		e.err = err
+	}
+}
+
+func (e *atomicError) setf(format string, args ...interface{}) {
+	e.set(fmt.Errorf(format, args...))
+}
+
+func (e *atomicError) get() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
 }
 
 func ackJob(t *testing.T, s *Store, ctx context.Context, jobID, assignmentID, workerID string) {
