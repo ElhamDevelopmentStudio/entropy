@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -143,6 +144,7 @@ type workerRunner struct {
 	stateFile         string
 	currentJobID      atomic.Value
 	httpClient        *http.Client
+	stateMu           sync.Mutex
 }
 
 type workerReconnectState struct {
@@ -214,6 +216,10 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 			current := r.getCurrentJobID()
 			if err := r.sendHeartbeat(ctx, current); err != nil {
 				log.Printf("heartbeat failed: %v", err)
+				continue
+			}
+			if err := r.flushPendingReconnectResults(ctx); err != nil {
+				log.Printf("pending reconnect flush failed: %v", err)
 			}
 			ticker.Reset(jitterDuration(r.heartbeatInterval))
 		}
@@ -309,6 +315,9 @@ func (r *workerRunner) nextJob(ctx context.Context) (*hdcf.AssignedJob, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNoContent {
+		if err := r.flushPendingReconnectResults(ctx); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -318,6 +327,9 @@ func (r *workerRunner) nextJob(ctx context.Context) (*hdcf.AssignedJob, error) {
 	var job hdcf.AssignedJob
 	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
 		return nil, err
+	}
+	if err := r.flushPendingReconnectResults(ctx); err != nil {
+		log.Printf("pending reconnect flush failed after next-job: %v", err)
 	}
 	return &job, nil
 }
@@ -657,6 +669,9 @@ func (r *workerRunner) persistReconnectState(state workerReconnectState) error {
 }
 
 func (r *workerRunner) setCurrentReconnectState(jobID, assignmentID string) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	state, err := r.loadReconnectState()
 	if err != nil {
 		return err
@@ -670,6 +685,9 @@ func (r *workerRunner) setCurrentReconnectState(jobID, assignmentID string) erro
 }
 
 func (r *workerRunner) clearCurrentReconnectState() error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	state, err := r.loadReconnectState()
 	if err != nil {
 		return err
@@ -680,6 +698,9 @@ func (r *workerRunner) clearCurrentReconnectState() error {
 }
 
 func (r *workerRunner) enqueueCompletedReconnectResult(entry hdcf.ReconnectCompletedJob) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	state, err := r.loadReconnectState()
 	if err != nil {
 		return err
@@ -698,6 +719,9 @@ func (r *workerRunner) enqueueCompletedReconnectResult(entry hdcf.ReconnectCompl
 }
 
 func (r *workerRunner) removeCompletedReconnectResult(jobID, assignmentID string) error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+
 	state, err := r.loadReconnectState()
 	if err != nil {
 		return err
@@ -714,6 +738,56 @@ func (r *workerRunner) removeCompletedReconnectResult(jobID, assignmentID string
 	}
 	state.CompletedJobs = next
 	return r.persistReconnectState(state)
+}
+
+func (r *workerRunner) flushPendingReconnectResults(ctx context.Context) error {
+	const batchSize = 24
+
+	for {
+		r.stateMu.Lock()
+		state, err := r.loadReconnectState()
+		r.stateMu.Unlock()
+		if err != nil {
+			return err
+		}
+		if len(state.CompletedJobs) == 0 {
+			return nil
+		}
+
+		batch := state.CompletedJobs
+		if len(batch) > batchSize {
+			batch = batch[:batchSize]
+		}
+		req := hdcf.WorkerReconnectRequest{
+			WorkerID:      r.workerID,
+			CompletedJobs: batch,
+		}
+		resp, err := r.postJSONWithResponse(ctx, r.controlURL+"/reconnect", req)
+		if err != nil {
+			return err
+		}
+		removedAny := false
+		for _, action := range resp.Actions {
+			switch action.Action {
+			case hdcf.ReconnectActionReplayCompleted, hdcf.ReconnectActionReplayFailed:
+				if action.Result == hdcf.ReconnectResultAccepted {
+					if err := r.removeCompletedReconnectResult(action.JobID, action.AssignmentID); err != nil {
+						return err
+					}
+					removedAny = true
+				}
+			case hdcf.ReconnectActionClearCurrentJob:
+				if action.JobID == "" || action.JobID == strings.TrimSpace(state.CurrentJobID) {
+					if err := r.clearCurrentReconnectState(); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if !removedAny {
+			return nil
+		}
+	}
 }
 
 func (r *workerRunner) handleJobFailure(ctx context.Context, job *hdcf.AssignedJob, err error) {

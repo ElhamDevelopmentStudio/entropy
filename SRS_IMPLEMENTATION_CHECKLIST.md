@@ -233,7 +233,7 @@ Progress:
 - Worker startup parses `-capabilities`/`HDCF_WORKER_CAPABILITIES`.
 - `/next-job` claims only jobs matching the requesting worker’s capabilities.
 
-14. `[ ]` P2-14 — Buffer and batch log upload on reconnection
+14. `[x]` P2-14 — Buffer and batch log upload on reconnection
 Requirement source: `SRS.md` Section 4.3.1
 Target: `cmd/worker/main.go`, `cmd/control/main.go`
 Implementation details:
@@ -242,6 +242,9 @@ Upload pending logs when heartbeat/next control succeeds.
 Acceptance criteria:
 No log loss due to short network disconnections.
 Dependency: P1-06, P1-05.
+Progress:
+- Added worker reconnect queue flush on successful heartbeat and `next-job` control calls.
+- Pending completed-failure artifacts and completion metadata are now resent via `/reconnect` in batches (stored queue entries) until acknowledged by the control plane.
 
 15. `[ ]` P2-15 — Add structured event logging and recovery audit trail
 Requirement source: reliability and eventual consistency requirements

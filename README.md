@@ -125,6 +125,11 @@ Reconnection behavior:
 - Control plane reconciles `current_job_id` and applies reconnection completion replay.
 - Worker removes replayed completed jobs from its local recovery state after an accepted action.
 
+Additional reconnection robustness:
+
+- Workers queue completion/failure replay payloads locally and flush them on successful `heartbeat`/`next-job` control-plane calls as well as startup reconnect.
+- If the control plane is temporarily unreachable while sending completions, finished artifacts remain locally queued and are retried automatically on the next successful control call.
+
 Worker startup options:
 
 - `-state-file` (default `<log-dir>/worker-state.json`) for persisted reconnect replay data.
