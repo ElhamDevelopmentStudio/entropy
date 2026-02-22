@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"encoding/hex"
 	"errors"
-	"flag"
 	"crypto/sha256"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +30,7 @@ func main() {
 	runner := &workerRunner{
 		controlURL:       strings.TrimRight(cfg.controlURL, "/"),
 		workerID:         cfg.workerID,
+		nonce:            cfg.nonce,
 		token:            cfg.token,
 		pollInterval:     cfg.pollInterval,
 		heartbeatInterval: cfg.heartbeatInterval,
@@ -48,6 +49,9 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := runner.register(ctx); err != nil {
+		log.Printf("worker registration failed: %v", err)
+	}
 	if err := runner.reconnect(ctx); err != nil {
 		log.Printf("startup reconnect failed: %v", err)
 	}
@@ -59,6 +63,7 @@ func main() {
 type workerConfig struct {
 	controlURL        string
 	workerID          string
+	nonce             string
 	token             string
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
@@ -71,6 +76,7 @@ func parseWorkerConfig() workerConfig {
 	var cfg workerConfig
 	flag.StringVar(&cfg.controlURL, "control-url", getenv("HDCF_CONTROL_URL", "http://localhost:8080"), "control plane url")
 	flag.StringVar(&cfg.workerID, "worker-id", getenv("HDCF_WORKER_ID", ""), "worker id")
+	flag.StringVar(&cfg.nonce, "worker-nonce", getenv("HDCF_WORKER_NONCE", ""), "optional registration nonce")
 	flag.StringVar(&cfg.token, "token", getenv("HDCF_API_TOKEN", "dev-token"), "api token")
 	var pollSec int
 	var heartbeatSec int
@@ -106,6 +112,7 @@ func getenv(name, fallback string) string {
 type workerRunner struct {
 	controlURL        string
 	workerID          string
+	nonce             string
 	token             string
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
@@ -129,6 +136,13 @@ func (r *workerRunner) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
+		}
+
+		if err := r.register(ctx); err != nil {
+			log.Printf("worker registration failed: %v", err)
+			time.Sleep(backoff)
+			backoff = nextBackoff(backoff, 30*time.Second)
+			continue
 		}
 
 		job, err := r.nextJob(ctx)
@@ -171,6 +185,10 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if err := r.register(ctx); err != nil {
+				log.Printf("worker registration failed: %v", err)
+				continue
+			}
 			current := r.getCurrentJobID()
 			if err := r.sendHeartbeat(ctx, current); err != nil {
 				log.Printf("heartbeat failed: %v", err)
@@ -230,6 +248,18 @@ func (r *workerRunner) getCurrentJobID() *string {
 		return nil
 	}
 	return &id
+}
+
+func (r *workerRunner) register(ctx context.Context) error {
+	req := hdcf.WorkerRegisterRequest{
+		WorkerID: r.workerID,
+		Nonce:    r.nonce,
+	}
+	payload, _ := json.Marshal(req)
+	endpoint := fmt.Sprintf("%s/register", r.controlURL)
+	return retryWithBackoff(ctx, r.requestTimeout, func() error {
+		return r.postJSON(ctx, endpoint, payload)
+	}, 4)
 }
 
 func (r *workerRunner) nextJob(ctx context.Context) (*hdcf.AssignedJob, error) {
