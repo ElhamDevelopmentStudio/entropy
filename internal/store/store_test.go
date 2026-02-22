@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -197,6 +198,143 @@ func TestClaimNextJobConcurrentWorkersAreMutualExclusive(t *testing.T) {
 	}
 	if len(assignmentByJob) != jobCount {
 		t.Fatalf("expected to claim all jobs, got %d of %d", len(assignmentByJob), jobCount)
+	}
+}
+
+func TestRecoverStaleRunningJobIsReclaimedAndReassigned(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, err := Open(":memory:", time.Second, StoreOptions{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = s.Close()
+	})
+
+	resp, err := s.CreateJob(ctx, hdcf.CreateJobRequest{
+		Command:     "sleep",
+		Args:        []string{"1"},
+		MaxAttempts: 2,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	jobID := resp.JobID
+
+	if err := s.RegisterWorker(ctx, hdcf.RegisterWorkerRequest{WorkerID: "worker-a"}); err != nil {
+		t.Fatalf("register worker-a: %v", err)
+	}
+	if err := s.RegisterWorker(ctx, hdcf.RegisterWorkerRequest{WorkerID: "worker-b"}); err != nil {
+		t.Fatalf("register worker-b: %v", err)
+	}
+
+	assigned, ok, err := s.ClaimNextJob(ctx, "worker-a")
+	if err != nil {
+		t.Fatalf("claim first: %v", err)
+	}
+	if !ok || assigned == nil || assigned.JobID != jobID {
+		t.Fatalf("expected first claim for job %s, got %+v (%v)", jobID, assigned, ok)
+	}
+
+	if err := s.AcknowledgeJob(ctx, hdcf.AckJobRequest{
+		JobID:        jobID,
+		WorkerID:     "worker-a",
+		AssignmentID: assigned.AssignmentID,
+	}); err != nil {
+		t.Fatalf("ack first: %v", err)
+	}
+
+	job := mustGetJob(t, s, ctx, jobID)
+	if job.Status != hdcf.StatusRunning {
+		t.Fatalf("expected running after ack, got %s", job.Status)
+	}
+	if job.WorkerID != "worker-a" {
+		t.Fatalf("expected worker-a, got %s", job.WorkerID)
+	}
+
+	_, err = s.db.ExecContext(
+		ctx,
+		`UPDATE workers SET status='OFFLINE', last_seen = ? WHERE worker_id = ?`,
+		time.Now().Unix()-10,
+		"worker-a",
+	)
+	if err != nil {
+		t.Fatalf("offline worker-a: %v", err)
+	}
+
+	if err := s.RecoverStaleWorkers(ctx); err != nil {
+		t.Fatalf("recover stale (offline): %v", err)
+	}
+	job = mustGetJob(t, s, ctx, jobID)
+	if job.Status != hdcf.StatusLost {
+		t.Fatalf("expected lost after stale recovery, got %s", job.Status)
+	}
+	if strings.TrimSpace(job.WorkerID) != "" {
+		t.Fatalf("expected lost job to clear worker assignment, got %s", job.WorkerID)
+	}
+
+	_, err = s.db.ExecContext(
+		ctx,
+		`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+		time.Now().Unix()-5,
+		jobID,
+	)
+	if err != nil {
+		t.Fatalf("age lost job: %v", err)
+	}
+
+	if err := s.RecoverStaleWorkers(ctx); err != nil {
+		t.Fatalf("recover stale (retry window): %v", err)
+	}
+	job = mustGetJob(t, s, ctx, jobID)
+	if job.Status != hdcf.StatusPending {
+		t.Fatalf("expected pending after retry window, got %s", job.Status)
+	}
+
+	reassigned, ok, err := s.ClaimNextJob(ctx, "worker-b")
+	if err != nil {
+		t.Fatalf("claim rebalance: %v", err)
+	}
+	if !ok || reassigned == nil || reassigned.JobID != jobID {
+		t.Fatalf("expected reassigned job %s, got %+v (%v)", jobID, reassigned, ok)
+	}
+	if reassigned.AttemptCount != 2 {
+		t.Fatalf("expected attempt_count 2 after reassignment, got %d", reassigned.AttemptCount)
+	}
+
+	if err := s.AcknowledgeJob(ctx, hdcf.AckJobRequest{
+		JobID:        jobID,
+		WorkerID:     "worker-b",
+		AssignmentID: reassigned.AssignmentID,
+	}); err != nil {
+		t.Fatalf("ack rebalance: %v", err)
+	}
+
+	if err := s.CompleteJob(ctx, hdcf.CompleteRequest{
+		JobID:         jobID,
+		WorkerID:      "worker-b",
+		AssignmentID:   reassigned.AssignmentID,
+		ArtifactID:     "artifact-recovered",
+		ExitCode:       0,
+		StdoutPath:     "/tmp/hdcf-stdout-recovered.txt",
+		StderrPath:     "/tmp/hdcf-stderr-recovered.txt",
+		StdoutTmpPath:  "/tmp/hdcf-stdout-recovered.tmp",
+		StderrTmpPath:  "/tmp/hdcf-stderr-recovered.tmp",
+		ArtifactBackend: hdcf.ArtifactStorageBackendLocal,
+		ArtifactUploadState: hdcf.ArtifactUploadStateOK,
+		CompletionSeq:   1,
+		ResultSummary:   "recovered and completed",
+	}); err != nil {
+		t.Fatalf("complete reassigned: %v", err)
+	}
+
+	job = mustGetJob(t, s, ctx, jobID)
+	if job.Status != hdcf.StatusCompleted {
+		t.Fatalf("expected job to complete, got %s", job.Status)
+	}
+	if job.AttemptCount != 2 {
+		t.Fatalf("expected final attempt_count 2, got %d", job.AttemptCount)
 	}
 }
 

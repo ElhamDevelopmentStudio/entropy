@@ -204,6 +204,7 @@ Acceptance criteria:
 - No lost progress under contention.
 Progress:
 - Added `TestClaimNextJobConcurrentWorkersAreMutualExclusive` to validate claim behavior under concurrent workers.
+- Added `TestRecoverStaleRunningJobIsReclaimedAndReassigned` to validate stale-worker handoff and retry-window re-queueing.
 - Hardening of claim/stale-worker logic under contention and end-to-end multi-worker stress scenario still pending.
 
 13. `[ ]` P5-13 — Config and deployment hardening
