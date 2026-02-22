@@ -70,6 +70,19 @@ Scheduling controls:
 - `-preempt-high-priority-floor` (priority threshold used during preemption mode)
 - `-config` (JSON file path; defaults to `HDCF_CONTROL_CONFIG`)
 
+#### Edge case: one active control plane
+
+- Run exactly one control plane for one cluster/database.
+- Keep `control` on Mac mini and run only `worker` on ASUS.
+- If you accidentally start another control node:
+
+```bash
+lsof -i :8080
+kill <pid>
+```
+
+Then keep only the intended control host active and restart workers if needed.
+
 ### 2) Start worker on ASUS
 
 ```bash
@@ -111,6 +124,66 @@ Worker options:
 - `-require-non-root` (default `false`) — reject jobs while running as root
 - `-dry-run` (default `false`) — validate policy and write simulated artifacts without executing jobs
 - `-config` (JSON file path; defaults to `HDCF_WORKER_CONFIG`)
+
+### 3) Run in background and auto-start on macOS login (recommended: launchd)
+
+To keep both control and worker processes alive after terminal close and on login:
+
+```bash
+go build -o ./bin/hdcf-control ./cmd/control
+go build -o ./bin/hdcf-worker ./cmd/worker
+chmod +x scripts/macos/launchd-entropy.sh
+```
+
+Prepare host config files from examples:
+
+```bash
+cp deploy/control-config.example.json /opt/hdcf/control-config.json
+cp deploy/worker-config.example.json /opt/hdcf/worker-mac-mini-config.json
+cp deploy/worker-config.example.json /opt/hdcf/worker-asus-config.json
+```
+
+Update tokens, IPs, and IDs in each config file.
+
+Mac mini (control + worker):
+
+```bash
+HDCF_CONTROL_BINARY=/opt/hdcf/hdcf-control \
+HDCF_WORKER_BINARY=/opt/hdcf/hdcf-worker \
+HDCF_CONTROL_CONFIG=/opt/hdcf/control-config.json \
+HDCF_WORKER_CONFIG=/opt/hdcf/worker-mac-mini-config.json \
+HDCF_LAUNCHD_ROLE=all \
+HDCF_PROJECT_ROOT=/opt/hdcf \
+./scripts/macos/launchd-entropy.sh install
+```
+
+ASUS (worker only):
+
+```bash
+HDCF_WORKER_BINARY=/opt/hdcf/hdcf-worker \
+HDCF_WORKER_CONFIG=/opt/hdcf/worker-asus-config.json \
+HDCF_LAUNCHD_ROLE=worker \
+HDCF_PROJECT_ROOT=/opt/hdcf \
+./scripts/macos/launchd-entropy.sh install
+```
+
+Service status and management:
+
+```bash
+./scripts/macos/launchd-entropy.sh status
+launchctl stop gui/$(id -u)/com.hdcf.control
+launchctl start gui/$(id -u)/com.hdcf.control
+launchctl stop gui/$(id -u)/com.hdcf.worker
+launchctl start gui/$(id -u)/com.hdcf.worker
+```
+
+Uninstall:
+
+```bash
+./scripts/macos/launchd-entropy.sh uninstall --role all
+```
+
+Logs are written to `~/Library/Logs/hdcf`.
 
 Environment variables:
 
