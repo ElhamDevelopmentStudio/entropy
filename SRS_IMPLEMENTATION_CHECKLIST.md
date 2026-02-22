@@ -128,22 +128,29 @@ Partial artifacts are never marked `COMPLETED`.
 Restart after partial write does not corrupt final state.
 Dependency: P1-04.
 
-7. `[ ]` P1-07 — Add optional checksum/integrity metadata for artifact sets
+7. `[x]` P1-07 — Add optional checksum/integrity metadata for artifact sets
 Requirement source: `SRS.md` Section 4.5
 Target: `cmd/worker/main.go`, `cmd/control/main.go`, `internal/store/store.go`
 Implementation details:
 Compute hash (sha256) during artifact finalization.
 Store hash in job record and return it in completion response.
+Progress:
+- Worker computes SHA-256 over finalized stdout/stderr artifacts.
+- Completion and reconnect payloads include `stdout_sha256` / `stderr_sha256`.
+- Control plane persists artifact checksums in job record.
 Acceptance criteria:
 Integrity field exists and can be used for manual/auto verification.
 Dependency: P1-06.
 
-8. `[ ]` P1-08 — Implement control-plane restart recovery sweep
+8. `[x]` P1-08 — Implement control-plane restart recovery sweep
 Requirement source: `SRS.md` Section 4.4.2
 Target: `cmd/control/main.go`, `internal/store/store.go`
 Implementation details:
-On startup run reconciliation pass for inconsistent `ASSIGNED`/`RUNNING` jobs and unregistered workers.
+Run reconciliation at control-plane startup for inconsistent `ASSIGNED`/`RUNNING` jobs and unregistered workers.
 Reset stale non-terminal jobs according to policy.
+Progress:
+- Boot path now invokes one startup recovery sweep.
+- Reconciler also reclaims `RUNNING` and `ASSIGNED` jobs whose `worker_id` no longer exists in `workers`.
 Acceptance criteria:
 After CP restart, no job is stranded due to unflushed memory state.
 Dependency: P1-01, P1-03.

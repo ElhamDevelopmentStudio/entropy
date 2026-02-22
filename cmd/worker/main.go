@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"flag"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log"
@@ -473,6 +475,19 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		return
 	}
 
+	stdoutSHA256, err := r.hashArtifact(stdoutPath)
+	if err != nil {
+		failMsg := fmt.Sprintf("artifact hash failed: %v", err)
+		r.handleJobFailure(ctx, job, errors.New(failMsg))
+		return
+	}
+	stderrSHA256, err := r.hashArtifact(stderrPath)
+	if err != nil {
+		failMsg := fmt.Sprintf("artifact hash failed: %v", err)
+		r.handleJobFailure(ctx, job, errors.New(failMsg))
+		return
+	}
+
 	duration := time.Since(start).Milliseconds()
 	summary := fmt.Sprintf("exit_code=0 duration_ms=%d", duration)
 	artifactID := hdcf.NewJobID()
@@ -486,6 +501,8 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		StderrPath:   stderrPath,
 		StdoutTmpPath: stdoutTmpPath,
 		StderrTmpPath: stderrTmpPath,
+		StdoutSHA256: stdoutSHA256,
+		StderrSHA256: stderrSHA256,
 		ResultSummary: summary,
 	}
 	reconnectEntry := hdcf.ReconnectCompletedJob{
@@ -498,6 +515,8 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		ArtifactID:    artifactID,
 		StdoutTmpPath: stdoutTmpPath,
 		StderrTmpPath: stderrTmpPath,
+		StdoutSHA256:  stdoutSHA256,
+		StderrSHA256:  stderrSHA256,
 		ResultSummary: summary,
 	}
 	if err := r.enqueueCompletedReconnectResult(reconnectEntry); err != nil {
@@ -519,6 +538,20 @@ func (r *workerRunner) finalizeArtifact(tmpPath, finalPath string) error {
 		return err
 	}
 	return os.Rename(tmpPath, finalPath)
+}
+
+func (r *workerRunner) hashArtifact(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (r *workerRunner) loadReconnectState() (workerReconnectState, error) {

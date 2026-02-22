@@ -135,6 +135,8 @@ type CompleteRequest struct {
 	StderrPath    string `json:"stderr_path"`
 	StdoutTmpPath string `json:"stdout_tmp_path"`
 	StderrTmpPath string `json:"stderr_tmp_path"`
+	StdoutSHA256  string `json:"stdout_sha256"`
+	StderrSHA256  string `json:"stderr_sha256"`
 	ResultSummary string `json:"result_summary"`
 }
 
@@ -156,6 +158,8 @@ type ReconnectCompletedJob struct {
 	StderrPath    string `json:"stderr_path"`
 	StdoutTmpPath string `json:"stdout_tmp_path"`
 	StderrTmpPath string `json:"stderr_tmp_path"`
+	StdoutSHA256  string `json:"stdout_sha256"`
+	StderrSHA256  string `json:"stderr_sha256"`
 	ResultSummary string `json:"result_summary"`
 	Error         string `json:"error"`
 }

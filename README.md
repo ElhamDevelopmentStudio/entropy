@@ -74,6 +74,7 @@ Completion safety behavior:
 - `POST /complete` and `POST /fail` require `assignment_id` and only apply when it matches the job's current lease.
 - `POST /complete` requires artifact contract fields (`artifact_id`, `stdout_path`, `stderr_path`, `stdout_tmp_path`, `stderr_tmp_path`).
 - `POST /complete` stores artifact metadata in SQLite and rejects completion when artifact fields are incomplete or violate the temp/final naming contract.
+- On success, worker computes and reports SHA-256 checksums for stdout/stderr artifacts; the control plane persists them in job records.
 - `/complete` and `/fail` are idempotent for terminal states (`COMPLETED`/`FAILED`) and return success without state changes.
 
 Reconnection behavior:
@@ -89,6 +90,8 @@ Worker startup options:
 
 - `-state-file` (default `<log-dir>/worker-state.json`) for persisted reconnect replay data.
 
+On startup, the control plane now performs one reconciliation sweep immediately (in addition to the periodic reconciler) to recover stale assignments and worker state after a restart.
+
 ## Data model
 
 Tables:
@@ -97,7 +100,8 @@ Tables:
   - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `created_at`, `updated_at`,
     `attempt_count`, `max_attempts`, `worker_id`, `assignment_id`, `assignment_expires_at`, `last_error`, `result_path`,
     `artifact_id`, `artifact_stdout_tmp_path`, `artifact_stdout_path`,
-    `artifact_stderr_tmp_path`, `artifact_stderr_path`, `updated_by`
+    `artifact_stdout_sha256`, `artifact_stderr_tmp_path`, `artifact_stderr_path`,
+    `artifact_stderr_sha256`, `updated_by`
 - `workers`:
   - `worker_id`, `last_seen`, `current_job_id`, `status`
 

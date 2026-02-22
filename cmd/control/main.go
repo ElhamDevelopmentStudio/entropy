@@ -29,6 +29,10 @@ func main() {
 	}
 	defer s.Close()
 
+	if err := s.RecoverStaleWorkers(ctx); err != nil {
+		log.Printf("startup reconciliation error: %v", err)
+	}
+
 	go runReconciler(ctx, s, cfg.reconcileInterval)
 
 	mux := http.NewServeMux()

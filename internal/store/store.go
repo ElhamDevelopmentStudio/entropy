@@ -66,8 +66,10 @@ func (s *Store) initSchema(ctx context.Context) error {
 		artifact_id TEXT,
 		artifact_stdout_tmp_path TEXT,
 		artifact_stdout_path TEXT,
+		artifact_stdout_sha256 TEXT,
 		artifact_stderr_tmp_path TEXT,
 		artifact_stderr_path TEXT,
+		artifact_stderr_sha256 TEXT,
 		updated_by TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at);
@@ -118,8 +120,10 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 		{name: "artifact_id", ddl: "ALTER TABLE jobs ADD COLUMN artifact_id TEXT"},
 		{name: "artifact_stdout_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_tmp_path TEXT"},
 		{name: "artifact_stdout_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_path TEXT"},
+		{name: "artifact_stdout_sha256", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_sha256 TEXT"},
 		{name: "artifact_stderr_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_tmp_path TEXT"},
 		{name: "artifact_stderr_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_path TEXT"},
+		{name: "artifact_stderr_sha256", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_sha256 TEXT"},
 	}
 	for _, col := range need {
 		if _, ok := columns[col.name]; ok {
@@ -495,6 +499,8 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 				StderrPath:   completed.StderrPath,
 				StdoutTmpPath: completed.StdoutTmpPath,
 				StderrTmpPath: completed.StderrTmpPath,
+				StdoutSHA256: completed.StdoutSHA256,
+				StderrSHA256: completed.StderrSHA256,
 				ResultSummary: completed.ResultSummary,
 			})
 			if err != nil {
@@ -619,14 +625,16 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	_, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
-		 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+		 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
 		hdcf.StatusCompleted,
 		req.StdoutPath,
 		req.ArtifactID,
 		req.StdoutTmpPath,
 		req.StdoutPath,
+		req.StdoutSHA256,
 		req.StderrTmpPath,
 		req.StderrPath,
+		req.StderrSHA256,
 		req.ResultSummary,
 		time.Now().Unix(),
 		req.WorkerID,
@@ -750,8 +758,46 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		     updated_by = 'reconciler',
 		     updated_at = ?
 		 WHERE status = 'RUNNING'
-		   AND worker_id IN (
+		   AND (
+		     worker_id IS NULL
+		     OR worker_id IN (
 		     SELECT worker_id FROM workers WHERE status = 'OFFLINE'
+		     )
+		   )`,
+		now,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
+		 SET status = 'LOST',
+		     worker_id = NULL,
+		     assignment_id = NULL,
+		     assignment_expires_at = NULL,
+		     updated_by = 'reconciler',
+		     updated_at = ?
+		 WHERE status = 'RUNNING'
+		   AND worker_id NOT IN (SELECT worker_id FROM workers)`,
+		now,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
+		 SET status = 'PENDING',
+		     worker_id = NULL,
+		     assignment_id = NULL,
+		     assignment_expires_at = NULL,
+		     updated_by = 'reconciler',
+		     updated_at = ?
+		 WHERE status = 'ASSIGNED'
+		   AND (
+		     worker_id IS NULL
+		     OR worker_id NOT IN (SELECT worker_id FROM workers)
 		   )`,
 		now,
 	); err != nil {
