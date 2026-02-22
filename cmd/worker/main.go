@@ -7,8 +7,8 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
 	"hdcf/internal/hdcf"
 )
 
@@ -50,6 +52,11 @@ func main() {
 		logRetentionDays:  cfg.logRetentionDays,
 		logCleanupInterval: cfg.logCleanupInterval,
 		reportMetrics:     cfg.reportMetrics,
+		commandAllowlistEnabled: cfg.commandAllowlistEnabled,
+		commandAllowlist:        cfg.commandAllowlist,
+		requireNonRoot:         cfg.requireNonRoot,
+		dryRun:                cfg.dryRun,
+		allowedWorkingDirs:    cfg.allowedWorkingDirs,
 	}
 	if runner.logDir == "" {
 		runner.logDir = "worker-logs"
@@ -117,6 +124,11 @@ type workerConfig struct {
 	logRetentionDays  int
 	logCleanupInterval time.Duration
 	reportMetrics     bool
+	commandAllowlistEnabled bool
+	commandAllowlist        []string
+	requireNonRoot         bool
+	dryRun                bool
+	allowedWorkingDirs    []string
 	tlsCA            string
 	tlsClientCert    string
 	tlsClientKey     string
@@ -140,6 +152,11 @@ func parseWorkerConfig() workerConfig {
 	var timeoutSec int
 	var logRetentionDays int
 	var logCleanupIntervalSec int
+	allowedCommands := flag.String("allowed-commands", getenv("HDCF_WORKER_ALLOWED_COMMANDS", ""), "comma-separated allowed command binaries when -command-allowlist is enabled")
+	allowedWorkingDirs := flag.String("allowed-working-dirs", getenv("HDCF_WORKER_ALLOWED_WORKING_DIRS", ""), "comma-separated allowed working directories for strict job execution checks")
+	commandAllowlist := flag.Bool("command-allowlist", getenvBool("HDCF_WORKER_COMMAND_ALLOWLIST", false), "enforce command allowlist before execution")
+	requireNonRoot := flag.Bool("require-non-root", getenvBool("HDCF_WORKER_REQUIRE_NON_ROOT", false), "reject running jobs when this process is running as root")
+	dryRun := flag.Bool("dry-run", getenvBool("HDCF_WORKER_DRY_RUN", false), "validate and simulate execution without running commands")
 	flag.IntVar(&pollSec, "poll-interval-seconds", 3, "poll interval seconds")
 	flag.IntVar(&heartbeatSec, "heartbeat-interval-seconds", 5, "heartbeat interval seconds")
 	flag.BoolVar(&cfg.reportMetrics, "heartbeat-metrics", false, "include optional resource metrics in heartbeat payload")
@@ -156,6 +173,14 @@ func parseWorkerConfig() workerConfig {
 	cfg.token = strings.TrimSpace(workerToken)
 	if cfg.token == "" {
 		cfg.token = strings.TrimSpace(token)
+	}
+	cfg.commandAllowlistEnabled = *commandAllowlist
+	cfg.commandAllowlist = normalizeCommandAllowlist(*allowedCommands)
+	cfg.requireNonRoot = *requireNonRoot
+	cfg.dryRun = *dryRun
+	cfg.allowedWorkingDirs = normalizeAllowedWorkingDirs(*allowedWorkingDirs)
+	if cfg.commandAllowlistEnabled && len(cfg.commandAllowlist) == 0 {
+		log.Fatalf("command allowlist is enabled but no allowed commands are configured")
 	}
 	if tokenTTLSeconds < 1 {
 		tokenTTLSeconds = 1
@@ -231,19 +256,69 @@ func getenvInt(name string, fallback int64) int64 {
 	return parsed
 }
 
-func splitCapabilities(raw string) []string {
+func getenvBool(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func splitCSV(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
 	for _, p := range parts {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
 			continue
 		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
 		out = append(out, trimmed)
+	}
+	return out
+}
+
+func splitCapabilities(raw string) []string {
+	return splitCSV(raw)
+}
+
+func normalizeCommandAllowlist(raw string) []string {
+	return splitCSV(raw)
+}
+
+func normalizeAllowedWorkingDirs(raw string) []string {
+	parsed := splitCSV(raw)
+	out := make([]string, 0, len(parsed))
+	seen := map[string]struct{}{}
+	for _, p := range parsed {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		abs, err := filepath.Abs(trimmed)
+		if err != nil {
+			abs = filepath.Clean(trimmed)
+		} else {
+			abs = filepath.Clean(abs)
+		}
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+		out = append(out, abs)
 	}
 	return out
 }
@@ -269,6 +344,11 @@ type workerRunner struct {
 	heartbeatSeq      int64
 	completionSeq     int64
 	reportMetrics     bool
+	commandAllowlistEnabled bool
+	commandAllowlist        []string
+	requireNonRoot         bool
+	dryRun                bool
+	allowedWorkingDirs    []string
 }
 
 type workerReconnectState struct {
@@ -530,6 +610,95 @@ func (r *workerRunner) getCurrentJobID() *string {
 		return nil
 	}
 	return &id
+}
+
+func (r *workerRunner) validateExecutionPolicy(job *hdcf.AssignedJob) error {
+	if err := r.validateNotRoot(); err != nil {
+		return err
+	}
+	if err := r.validateAllowedCommand(job.Command); err != nil {
+		return err
+	}
+	if err := r.validateWorkingDir(job.WorkingDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *workerRunner) validateNotRoot() error {
+	if !r.requireNonRoot {
+		return nil
+	}
+	current, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("resolve worker process user: %w", err)
+	}
+	if current.Username == "root" || current.Uid == "0" {
+		return fmt.Errorf("execution denied by worker policy: running as root")
+	}
+	return nil
+}
+
+func (r *workerRunner) validateAllowedCommand(command string) error {
+	if !r.commandAllowlistEnabled {
+		return nil
+	}
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return fmt.Errorf("command is empty")
+	}
+	requestedCommand := filepath.Clean(command)
+	requestedCommandBase := filepath.Base(requestedCommand)
+	for _, allowed := range r.commandAllowlist {
+		normalizedAllowed := filepath.Clean(strings.TrimSpace(allowed))
+		if normalizedAllowed == "" {
+			continue
+		}
+		if normalizedAllowed == requestedCommand || normalizedAllowed == requestedCommandBase {
+			return nil
+		}
+		allowedBase := filepath.Base(normalizedAllowed)
+		if allowedBase == requestedCommandBase {
+			return nil
+		}
+	}
+	return fmt.Errorf("command blocked by allowlist: %s", command)
+}
+
+func (r *workerRunner) validateWorkingDir(raw string) error {
+	if len(r.allowedWorkingDirs) == 0 {
+		return nil
+	}
+	workingDir := strings.TrimSpace(raw)
+	if workingDir == "" {
+		return fmt.Errorf("working_dir is required when working directory allowlist is configured")
+	}
+	abs, err := filepath.Abs(workingDir)
+	if err != nil {
+		return fmt.Errorf("resolve working_dir: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("working_dir does not exist: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("working_dir is not a directory: %s", abs)
+	}
+	abs = filepath.Clean(abs)
+	for _, allowed := range r.allowedWorkingDirs {
+		allowedClean := filepath.Clean(strings.TrimSpace(allowed))
+		if allowedClean == "" {
+			continue
+		}
+		relative, err := filepath.Rel(allowedClean, abs)
+		if err != nil {
+			continue
+		}
+		if relative == "." || (relative != ".." && !strings.HasPrefix(relative, fmt.Sprintf("..%s", string(filepath.Separator)))) {
+			return nil
+		}
+	}
+	return fmt.Errorf("working_dir blocked by allowlist: %s", abs)
 }
 
 func (r *workerRunner) register(ctx context.Context) error {
@@ -882,6 +1051,11 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 	stdoutPath := filepath.Join(r.logDir, fmt.Sprintf("%s.stdout.log", job.JobID))
 	stderrPath := filepath.Join(r.logDir, fmt.Sprintf("%s.stderr.log", job.JobID))
 
+	if err := r.validateExecutionPolicy(job); err != nil {
+		r.handleJobFailure(ctx, job, fmt.Errorf("execution policy denied: %w", err))
+		return
+	}
+
 	stdout, err := os.Create(stdoutTmpPath)
 	if err != nil {
 		r.handleJobFailure(ctx, job, err)
@@ -900,6 +1074,53 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
+
+	if r.dryRun {
+		if _, err := fmt.Fprintf(stdout, "dry-run execution: command=%q args=%v timeout_ms=%d working_dir=%q\n", job.Command, job.Args, job.TimeoutMs, strings.TrimSpace(job.WorkingDir)); err != nil {
+			r.handleJobFailure(ctx, job, err)
+			return
+		}
+		if _, err := fmt.Fprintf(stderr, "dry-run mode enabled; no process execution performed\n"); err != nil {
+			r.handleJobFailure(ctx, job, err)
+			return
+		}
+		workerEvent("info", "worker.job_execute", map[string]any{
+			"worker_id":     r.workerID,
+			"job_id":        job.JobID,
+			"assignment_id": job.AssignmentID,
+			"state":         "dry_run_validated",
+			"command":       job.Command,
+			"attempt_count": job.AttemptCount,
+		})
+		if err := r.finalizeArtifact(stdoutTmpPath, stdoutPath); err != nil {
+			failMsg := fmt.Sprintf("artifact finalization failed: %v", err)
+			r.handleJobFailure(ctx, job, errors.New(failMsg))
+			return
+		}
+		if err := r.finalizeArtifact(stderrTmpPath, stderrPath); err != nil {
+			_ = os.Rename(stdoutPath, stdoutTmpPath)
+			failMsg := fmt.Sprintf("artifact finalization failed: %v", err)
+			r.handleJobFailure(ctx, job, errors.New(failMsg))
+			return
+		}
+
+		stdoutSHA256, err := r.hashArtifact(stdoutPath)
+		if err != nil {
+			failMsg := fmt.Sprintf("artifact hash failed: %v", err)
+			r.handleJobFailure(ctx, job, errors.New(failMsg))
+			return
+		}
+		stderrSHA256, err := r.hashArtifact(stderrPath)
+		if err != nil {
+			failMsg := fmt.Sprintf("artifact hash failed: %v", err)
+			r.handleJobFailure(ctx, job, errors.New(failMsg))
+			return
+		}
+		summary := fmt.Sprintf("dry_run validation completed duration_ms=%d", time.Since(start).Milliseconds())
+		r.reportCompletedJob(ctx, job, start, summary, stdoutPath, stderrPath, stdoutTmpPath, stderrTmpPath, stdoutSHA256, stderrSHA256, 0)
+		return
+	}
+
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -997,7 +1218,6 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		})
 		return
 	}
-
 	if err := r.finalizeArtifact(stdoutTmpPath, stdoutPath); err != nil {
 		failMsg := fmt.Sprintf("artifact finalization failed: %v", err)
 		r.handleJobFailure(ctx, job, errors.New(failMsg))
@@ -1023,24 +1243,50 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		return
 	}
 
+	summary := fmt.Sprintf("exit_code=0 duration_ms=%d", time.Since(start).Milliseconds())
+	r.reportCompletedJob(ctx, job, start, summary, stdoutPath, stderrPath, stdoutTmpPath, stderrTmpPath, stdoutSHA256, stderrSHA256, exitCode)
+}
+
+func (r *workerRunner) finalizeArtifact(tmpPath, finalPath string) error {
+	_, err := os.Stat(tmpPath)
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, finalPath)
+}
+
+func (r *workerRunner) hashArtifact(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func (r *workerRunner) reportCompletedJob(ctx context.Context, job *hdcf.AssignedJob, start time.Time, summary, stdoutPath, stderrPath, stdoutTmpPath, stderrTmpPath, stdoutSHA256, stderrSHA256 string, exitCode int) {
 	duration := time.Since(start).Milliseconds()
-	summary := fmt.Sprintf("exit_code=0 duration_ms=%d", duration)
 	artifactID := hdcf.NewJobID()
 	completionSeq := r.nextCompletionSeq()
 	compReq := hdcf.CompleteRequest{
-		JobID:        job.JobID,
-		WorkerID:     r.workerID,
-		AssignmentID: job.AssignmentID,
-		ExitCode:     exitCode,
-		ArtifactID:   artifactID,
-		StdoutPath:   stdoutPath,
-		StderrPath:   stderrPath,
+		JobID:         job.JobID,
+		WorkerID:      r.workerID,
+		AssignmentID:  job.AssignmentID,
+		ExitCode:      exitCode,
+		ArtifactID:    artifactID,
+		StdoutPath:    stdoutPath,
+		StderrPath:    stderrPath,
 		StdoutTmpPath: stdoutTmpPath,
 		StderrTmpPath: stderrTmpPath,
-		StdoutSHA256: stdoutSHA256,
-		StderrSHA256: stderrSHA256,
-		CompletionSeq: completionSeq,
-		ResultSummary: summary,
+		StdoutSHA256:  stdoutSHA256,
+		StderrSHA256:  stderrSHA256,
+		CompletionSeq:  completionSeq,
+		ResultSummary:  summary,
 	}
 	reconnectEntry := hdcf.ReconnectCompletedJob{
 		JobID:         job.JobID,
@@ -1055,15 +1301,15 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		StderrTmpPath: stderrTmpPath,
 		StdoutSHA256:  stdoutSHA256,
 		StderrSHA256:  stderrSHA256,
-		ResultSummary: summary,
+		ResultSummary:  summary,
 	}
 	workerEvent("info", "worker.job_execute", map[string]any{
-		"worker_id":   r.workerID,
-		"job_id":      job.JobID,
+		"worker_id":     r.workerID,
+		"job_id":        job.JobID,
 		"assignment_id": job.AssignmentID,
-		"state":       "ready_for_completion",
-		"duration_ms": duration,
-		"artifact_id": artifactID,
+		"state":         "ready_for_completion",
+		"duration_ms":   duration,
+		"artifact_id":   artifactID,
 		"stdout_sha256": stdoutSHA256,
 		"stderr_sha256": stderrSHA256,
 	})
@@ -1087,6 +1333,7 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			"stdout_path":   stdoutPath,
 			"stderr_path":   stderrPath,
 			"exit_code":     exitCode,
+			"result_summary": summary,
 		})
 		if err := r.removeCompletedReconnectResult(job.JobID, job.AssignmentID); err != nil {
 			workerEvent("warn", "worker.job_completed", map[string]any{
@@ -1104,28 +1351,6 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			"error":         "report_complete_failed_after_retries",
 		})
 	}
-}
-
-func (r *workerRunner) finalizeArtifact(tmpPath, finalPath string) error {
-	_, err := os.Stat(tmpPath)
-	if err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, finalPath)
-}
-
-func (r *workerRunner) hashArtifact(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	hash := sha256.New()
-	if _, err := io.Copy(hash, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func (r *workerRunner) loadReconnectState() (workerReconnectState, error) {

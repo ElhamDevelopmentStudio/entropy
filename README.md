@@ -71,6 +71,11 @@ Worker options:
 - `-log-retention-days` (default `30`)
 - `-log-cleanup-interval-seconds` (default `300`)
 - `-heartbeat-metrics` (default `false`) — include optional resource metrics in heartbeat payload
+- `-command-allowlist` (default `false`) — enable command allowlist enforcement
+- `-allowed-commands` (default ``) — comma-separated command allowlist when `-command-allowlist` is on
+- `-allowed-working-dirs` (default ``) — comma-separated list of allowed working directories
+- `-require-non-root` (default `false`) — reject jobs while running as root
+- `-dry-run` (default `false`) — validate policy and write simulated artifacts without executing jobs
 
 Environment variables:
 
@@ -80,12 +85,23 @@ Environment variables:
 - `HDCF_WORKER_ID`
 - `HDCF_WORKER_LOG_RETENTION_DAYS` (default `30`)
 - `HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS` (default `300`)
+- `HDCF_WORKER_COMMAND_ALLOWLIST` (`true` to enforce allowlist mode)
+- `HDCF_WORKER_ALLOWED_COMMANDS` (comma-separated allowed command binaries)
+- `HDCF_WORKER_ALLOWED_WORKING_DIRS` (comma-separated working directory allowlist)
+- `HDCF_WORKER_REQUIRE_NON_ROOT` (`true` to block root execution)
+- `HDCF_WORKER_DRY_RUN` (`true` for simulated execution)
 - `HDCF_TLS_CA` (ca bundle for control-plane cert)
 - `HDCF_TLS_CLIENT_CERT` (client cert for mTLS)
 - `HDCF_TLS_CLIENT_KEY` (client key for mTLS)
 - `HDCF_WORKER_TOKEN` (worker token; defaults to `HDCF_API_TOKEN`)
 - `HDCF_WORKER_TOKEN_SECRET` (HMAC secret for signed token mode)
 - `HDCF_WORKER_TOKEN_TTL_SECONDS` (default `3600`)
+
+Security note:
+
+- When `-command-allowlist` is enabled, the worker only executes commands whose binary name or full command path matches one of `-allowed-commands` (or `HDCF_WORKER_ALLOWED_COMMANDS`).
+- When `-allowed-working-dirs` is set, `working_dir` must exist and be under one of the allowed directories.
+- If `-dry-run` is enabled, no external processes are spawned; jobs are validated and completed as zero exit jobs with recorded dry-run artifacts.
 
 ## Security model
 

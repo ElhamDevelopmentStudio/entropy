@@ -94,8 +94,8 @@ Progress:
 - Added incremental event cursor support via `GET /events?since_id`.
 - Added audit event indexes for `component`, `event`, and `ts/id` scan patterns with schema migration-safe creation.
 
-5. `[ ]` P5-05 — Worker-side security hardening for command execution
-Current status: arbitrary shell command string execution
+5. `[x]` P5-05 — Worker-side security hardening for command execution
+Current status: implemented in `cmd/worker/main.go` with runtime policy controls
 Target: `cmd/worker/main.go`
 Implementation tasks:
 - Add allowlist mode for command binaries.
@@ -104,6 +104,11 @@ Implementation tasks:
 Acceptance criteria:
 - Dangerous ad hoc commands are blocked when allowlist mode is enabled.
 - Same execution API still supports existing jobs by default (`compat` off by default in hardening profiles).
+- Controls now include:
+  - `-command-allowlist` + `-allowed-commands` (`HDCF_WORKER_COMMAND_ALLOWLIST`/`HDCF_WORKER_ALLOWED_COMMANDS`)
+  - `-allowed-working-dirs` (`HDCF_WORKER_ALLOWED_WORKING_DIRS`)
+  - `-require-non-root` (`HDCF_WORKER_REQUIRE_NON_ROOT`)
+  - `-dry-run` (`HDCF_WORKER_DRY_RUN`)
 
 6. `[ ]` P5-06 — Better reconnection model and idempotency across all endpoints
 Current status: completion/fail heartbeat sequencing already implemented
