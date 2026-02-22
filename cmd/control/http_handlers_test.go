@@ -46,8 +46,8 @@ func newControlHarness(t *testing.T) *controlHarness {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ui", withAdminAuth(cfg, dashboardUI()))
-	mux.HandleFunc("/ui/", withAdminAuth(cfg, dashboardUI()))
+	mux.HandleFunc("/ui", withUIAuth(cfg, dashboardUI()))
+	mux.HandleFunc("/ui/", withUIAuth(cfg, dashboardUI()))
 	mux.HandleFunc("/healthz", healthzHandler(s, dbPath))
 	mux.HandleFunc("/jobs", withAdminAuth(cfg, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAdminAuth(cfg, getJobHandler(s)))
@@ -423,5 +423,18 @@ func TestControlUIRequiresAdminToken(t *testing.T) {
 	resp, raw := h.doJSON(t, http.MethodGet, "/ui", controlAdminToken, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected /ui with admin token to return 200, got %d body=%s", resp.StatusCode, string(raw))
+	}
+}
+
+func TestControlUISupportsQueryToken(t *testing.T) {
+	t.Parallel()
+	h := newControlHarness(t)
+
+	resp, raw := h.doJSON(t, http.MethodGet, "/ui?token="+controlAdminToken, "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /ui with query token to return 200, got %d body=%s", resp.StatusCode, string(raw))
+	}
+	if !strings.Contains(string(raw), "<title>HDCF Dashboard</title>") {
+		t.Fatalf("expected dashboard HTML body, got: %s", string(raw))
 	}
 }

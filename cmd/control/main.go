@@ -73,8 +73,8 @@ func main() {
 	go runCleanup(ctx, s, cfg.cleanupInterval, cfg.jobsRetentionCompletedDays, cfg.artifactsRetentionDays, cfg.eventsRetentionDays)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ui", withAdminAuth(&cfg, dashboardUI()))
-	mux.HandleFunc("/ui/", withAdminAuth(&cfg, dashboardUI()))
+	mux.HandleFunc("/ui", withUIAuth(&cfg, dashboardUI()))
+	mux.HandleFunc("/ui/", withUIAuth(&cfg, dashboardUI()))
 	mux.HandleFunc("/healthz", healthzHandler(s, cfg.dbPath))
 	mux.HandleFunc("/jobs", withAdminAuth(&cfg, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAdminAuth(&cfg, getJobHandler(s)))
@@ -581,6 +581,14 @@ const dashboardHTML = `<!doctype html>
       }
 
       async function init() {
+        const queryToken = new URLSearchParams(window.location.search).get('token');
+        if (queryToken) {
+          tokenInput.value = queryToken;
+          localStorage.setItem(STORAGE_KEY, queryToken);
+          const current = new URL(window.location.href);
+          current.searchParams.delete('token');
+          window.history.replaceState({}, '', current.toString());
+        }
         const saved = localStorage.getItem(STORAGE_KEY);
         if (saved) tokenInput.value = saved;
         setStatus('ready');
@@ -825,12 +833,51 @@ func getenvInt(name string, fallback int64) int64 {
 
 func withAdminAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := cfg.authorizeAdminRequest(strings.TrimSpace(r.Header.Get(authHeaderName))); err != nil {
+		if err := cfg.authorizeAdminRequest(getAdminTokenFromRequest(r)); err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		next(w, r)
 	}
+}
+
+func withUIAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := getUIAdminTokenFromRequest(r)
+		if strings.TrimSpace(token) != "" && cfg.authorizeAdminRequest(token) == nil {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "hdcf_admin_token",
+				Value:    token,
+				Path:     "/",
+				HttpOnly: true,
+				MaxAge:   86400,
+				SameSite: http.SameSiteLaxMode,
+				Secure:   r.TLS != nil,
+			})
+		}
+		if err := cfg.authorizeAdminRequest(token); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func getAdminTokenFromRequest(r *http.Request) string {
+	if token := strings.TrimSpace(r.Header.Get(authHeaderName)); token != "" {
+		return token
+	}
+	if cookie, err := r.Cookie("hdcf_admin_token"); err == nil {
+		return strings.TrimSpace(cookie.Value)
+	}
+	return ""
+}
+
+func getUIAdminTokenFromRequest(r *http.Request) string {
+	if token := getAdminTokenFromRequest(r); token != "" {
+		return token
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
 }
 
 func withWorkerAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
