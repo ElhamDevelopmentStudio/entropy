@@ -246,7 +246,7 @@ Progress:
 - Added worker reconnect queue flush on successful heartbeat and `next-job` control calls.
 - Pending completed-failure artifacts and completion metadata are now resent via `/reconnect` in batches (stored queue entries) until acknowledged by the control plane.
 
-15. `[ ]` P2-15 — Add structured event logging and recovery audit trail
+15. `[x]` P2-15 — Add structured event logging and recovery audit trail
 Requirement source: reliability and eventual consistency requirements
 Target: `cmd/control/main.go`, `cmd/worker/main.go`
 Implementation details:
@@ -255,8 +255,13 @@ Persist enough context for post-mortem.
 Acceptance criteria:
 Operations are explainable from logs without manual DB introspection.
 Dependency: P1-01.
+Progress:
+- Added control-plane `audit_events` table with request correlation and structured details.
+- Added control-plane DB event logging for lifecycle/reconciliation transitions (`job.*`, `worker.*`, `reconcile.*`).
+- Wired request IDs (`X-Request-ID` or generated UUID) into control-plane store calls and `recover`/reconcile paths.
+- Added `GET /events` API for filtered recovery audits (`component`, `event`, `worker_id`, `job_id`, `limit`).
 
-16. `[ ]` P2-16 — Add duplicate message reorder handling in `/heartbeat` and `/complete`
+16. `[x]` P2-16 — Add duplicate message reorder handling in `/heartbeat` and `/complete`
 Requirement source: `SRS.md` Reliability section
 Target: `internal/store/store.go`, `cmd/control/main.go`
 Implementation details:
@@ -265,6 +270,11 @@ Ignore stale older messages when ordering is uncertain.
 Acceptance criteria:
 Late packets do not rollback newer state.
 Dependency: P1-04.
+Progress:
+- Added monotonic per-worker heartbeat sequences via `workers.heartbeat_seq`.
+  `/heartbeat` ignores stale sequences and only accepts newer sequence numbers.
+- Added completion sequence tracking via `jobs.completion_seq`.
+  `/complete` ignores stale/reordered duplicate completion messages and persists the latest completion sequence per job.
 
 17. `[ ]` P3-17 — Add resource-metric heartbeat payload support (optional MVP field)
 Requirement source: `SRS.md` Section 4.2

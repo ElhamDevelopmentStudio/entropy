@@ -19,11 +19,30 @@ type Store struct {
 	heartbeatTimeout time.Duration
 }
 
+type auditRequestIDKey struct{}
+
 var (
 	ErrAbortNoTarget       = errors.New("job_id or worker_id required")
 	ErrAbortWorkerMismatch = errors.New("worker_id mismatch")
 	ErrAbortCompleted      = errors.New("cannot abort completed job")
 )
+
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, auditRequestIDKey{}, requestID)
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v := ctx.Value(auditRequestIDKey{})
+	requestID, _ := v.(string)
+	return strings.TrimSpace(requestID)
+}
 
 func Open(path string, heartbeatTimeout time.Duration) (*Store, error) {
 	db, err := sql.Open("sqlite3", path)
@@ -72,6 +91,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		assignment_id TEXT,
 		assignment_expires_at INTEGER,
 		last_error TEXT,
+		completion_seq INTEGER NOT NULL DEFAULT 0,
 		result_path TEXT,
 		artifact_id TEXT,
 		artifact_stdout_tmp_path TEXT,
@@ -90,8 +110,24 @@ func (s *Store) initSchema(ctx context.Context) error {
 		worker_capabilities TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL,
 		registered_at INTEGER,
-		registration_nonce TEXT
+		registration_nonce TEXT,
+		heartbeat_seq INTEGER NOT NULL DEFAULT 0
 	);
+	CREATE TABLE IF NOT EXISTS audit_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts INTEGER NOT NULL,
+		component TEXT NOT NULL,
+		level TEXT NOT NULL,
+		event TEXT NOT NULL,
+		request_id TEXT,
+		worker_id TEXT,
+		job_id TEXT,
+		details TEXT NOT NULL DEFAULT '{}'
+	);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_component_event ON audit_events(component, event);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_job ON audit_events(job_id);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_worker ON audit_events(worker_id);
 	`
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
@@ -100,10 +136,100 @@ func (s *Store) initSchema(ctx context.Context) error {
 	if err := s.ensureJobColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAuditEventColumns(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureJobIndexes(ctx); err != nil {
 		return err
 	}
 	return s.ensureWorkerColumns(ctx)
+}
+
+func (s *store) ensureAuditEventColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(audit_events)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	columns := map[string]struct{}{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	type columnDef struct {
+		name string
+		ddl  string
+	}
+	need := []columnDef{
+		{name: "request_id", ddl: "ALTER TABLE audit_events ADD COLUMN request_id TEXT"},
+		{name: "worker_id", ddl: "ALTER TABLE audit_events ADD COLUMN worker_id TEXT"},
+		{name: "job_id", ddl: "ALTER TABLE audit_events ADD COLUMN job_id TEXT"},
+		{name: "details", ddl: "ALTER TABLE audit_events ADD COLUMN details TEXT NOT NULL DEFAULT '{}'"},
+	}
+	for _, col := range need {
+		if _, ok := columns[col.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) logEvent(ctx context.Context, tx *sql.Tx, component, level, eventName, workerID, jobID string, details map[string]any) error {
+	requestID := requestIDFromContext(ctx)
+	now := time.Now().Unix()
+	if strings.TrimSpace(level) == "" {
+		level = "info"
+	}
+	if strings.TrimSpace(eventName) == "" {
+		return nil
+	}
+	if details == nil {
+		details = map[string]any{}
+	}
+	raw, err := json.Marshal(details)
+	if err != nil {
+		return err
+	}
+	stmt := `INSERT INTO audit_events (ts, component, level, event, request_id, worker_id, job_id, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	if tx != nil {
+		_, err = tx.ExecContext(ctx, stmt,
+			now,
+			"control_plane",
+			level,
+			eventName,
+			requestID,
+			workerID,
+			jobID,
+			string(raw),
+		)
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, stmt,
+		now,
+		"control_plane",
+		level,
+		eventName,
+		requestID,
+		workerID,
+		jobID,
+		string(raw),
+	)
+	return err
 }
 
 func (s *Store) ensureJobColumns(ctx context.Context) error {
@@ -147,6 +273,7 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 		{name: "artifact_stderr_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_tmp_path TEXT"},
 		{name: "artifact_stderr_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_path TEXT"},
 		{name: "artifact_stderr_sha256", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_sha256 TEXT"},
+		{name: "completion_seq", ddl: "ALTER TABLE jobs ADD COLUMN completion_seq INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, col := range need {
 		if _, ok := columns[col.name]; ok {
@@ -195,6 +322,7 @@ func (s *Store) ensureWorkerColumns(ctx context.Context) error {
 		{name: "registered_at", ddl: "ALTER TABLE workers ADD COLUMN registered_at INTEGER"},
 		{name: "registration_nonce", ddl: "ALTER TABLE workers ADD COLUMN registration_nonce TEXT"},
 		{name: "worker_capabilities", ddl: "ALTER TABLE workers ADD COLUMN worker_capabilities TEXT NOT NULL DEFAULT ''"},
+		{name: "heartbeat_seq", ddl: "ALTER TABLE workers ADD COLUMN heartbeat_seq INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, col := range need {
 		if _, ok := columns[col.name]; ok {
@@ -336,6 +464,16 @@ func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.
 	if err != nil {
 		return hdcf.CreateJobResponse{}, err
 	}
+
+	_ = s.logEvent(ctx, nil, "info", "job.create", "", id, map[string]any{
+		"command":      req.Command,
+		"status":       hdcf.StatusPending,
+		"args_count":   len(req.Args),
+		"attempts":     req.MaxAttempts,
+		"priority":     priority,
+		"scheduled_at": scheduledAt,
+		"needs_gpu":    req.NeedsGPU,
+	})
 
 	return hdcf.CreateJobResponse{
 		JobID:  id,
@@ -577,6 +715,96 @@ func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
 	return result, nil
 }
 
+func (s *Store) ListAuditEvents(ctx context.Context, component, eventName, workerID, jobID string, limit int) ([]hdcf.AuditEvent, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+
+	component = strings.TrimSpace(component)
+	eventName = strings.TrimSpace(eventName)
+	workerID = strings.TrimSpace(workerID)
+	jobID = strings.TrimSpace(jobID)
+
+	query := `
+		SELECT id, ts, component, level, event, request_id, worker_id, job_id, details
+		FROM audit_events
+	`
+	args := []any{}
+	filters := []string{}
+	if component != "" {
+		filters = append(filters, "component = ?")
+		args = append(args, component)
+	}
+	if eventName != "" {
+		filters = append(filters, "event = ?")
+		args = append(args, eventName)
+	}
+	if workerID != "" {
+		filters = append(filters, "worker_id = ?")
+		args = append(args, workerID)
+	}
+	if jobID != "" {
+		filters = append(filters, "job_id = ?")
+		args = append(args, jobID)
+	}
+	if len(filters) > 0 {
+		query += " WHERE " + strings.Join(filters, " AND ")
+	}
+	query += " ORDER BY ts DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]hdcf.AuditEvent, 0, 32)
+	for rows.Next() {
+		var row hdcf.AuditEvent
+		var detailsJSON string
+		var requestID sql.NullString
+		var rowWorkerID sql.NullString
+		var rowJobID sql.NullString
+		if err := rows.Scan(
+			&row.ID,
+			&row.Timestamp,
+			&row.Component,
+			&row.Level,
+			&row.Event,
+			&requestID,
+			&rowWorkerID,
+			&rowJobID,
+			&detailsJSON,
+		); err != nil {
+			return nil, err
+		}
+		row.RequestID = strings.TrimSpace(requestID.String)
+		if rowWorkerID.Valid {
+			row.WorkerID = strings.TrimSpace(rowWorkerID.String)
+		}
+		if rowJobID.Valid {
+			row.JobID = strings.TrimSpace(rowJobID.String)
+		}
+		if strings.TrimSpace(detailsJSON) == "" {
+			row.Details = map[string]interface{}{}
+		} else if err := json.Unmarshal([]byte(detailsJSON), &row.Details); err != nil {
+			return nil, err
+		}
+		if row.Details == nil {
+			row.Details = map[string]interface{}{}
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (s *Store) IsWorkerRegistered(ctx context.Context, workerID string) (bool, error) {
 	id := strings.TrimSpace(workerID)
 	if id == "" {
@@ -624,8 +852,8 @@ func (s *Store) RegisterWorker(ctx context.Context, req hdcf.RegisterWorkerReque
 
 	_, err = tx.ExecContext(
 		ctx,
-		`INSERT INTO workers (worker_id, last_seen, current_job_id, status, registered_at, registration_nonce, worker_capabilities)
-		 VALUES (?, ?, NULL, 'ONLINE', ?, ?, ?)
+		`INSERT INTO workers (worker_id, last_seen, current_job_id, status, registered_at, registration_nonce, worker_capabilities, heartbeat_seq)
+		 VALUES (?, ?, NULL, 'ONLINE', ?, ?, ?, 0)
 		 ON CONFLICT(worker_id) DO UPDATE SET
 		   last_seen = excluded.last_seen,
 		   status = 'ONLINE',
@@ -647,6 +875,11 @@ func (s *Store) RegisterWorker(ctx context.Context, req hdcf.RegisterWorkerReque
 	if err != nil {
 		return err
 	}
+	_ = s.logEvent(ctx, tx, "info", "worker.register", workerID, "", map[string]any{
+		"registered_at": now,
+		"nonce":         nonce != "",
+		"capabilities":  len(req.Capabilities),
+	})
 	return tx.Commit()
 }
 
@@ -753,6 +986,13 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 		job.AttemptCount++
 		job.AssignmentID = assignmentID
 		job.AssignmentExpiresAt = assignmentExpiresAt
+		_ = s.logEvent(ctx, tx, "info", "job.claim", workerID, job.JobID, map[string]any{
+			"from_status":         hdcf.StatusPending,
+			"to_status":           hdcf.StatusAssigned,
+			"assignment_id":       assignmentID,
+			"attempt_count":       job.AttemptCount,
+			"assignment_expires_at": assignmentExpiresAt,
+		})
 		if err := tx.Commit(); err != nil {
 			return nil, false, err
 		}
@@ -785,11 +1025,18 @@ func (s *Store) AcknowledgeJob(ctx context.Context, req hdcf.AckJobRequest) erro
 		}
 		return err
 	}
+	currentStatus := strings.TrimSpace(status.String)
 
-	if status.String == hdcf.StatusCompleted {
+	if currentStatus == hdcf.StatusCompleted {
+		_ = s.logEvent(ctx, tx, "info", "job.ack", req.WorkerID, req.JobID, map[string]any{
+			"from_status": currentStatus,
+			"to_status":   currentStatus,
+			"assignment_id": req.AssignmentID,
+			"state":        "noop_terminal",
+		})
 		return tx.Commit()
 	}
-	if status.String == hdcf.StatusRunning {
+	if currentStatus == hdcf.StatusRunning {
 		if strings.TrimSpace(req.WorkerID) == "" {
 			return fmt.Errorf("worker_id required")
 		}
@@ -805,10 +1052,16 @@ func (s *Store) AcknowledgeJob(ctx context.Context, req hdcf.AckJobRequest) erro
 		if assignmentID.String != req.AssignmentID {
 			return fmt.Errorf("assignment_id mismatch")
 		}
+		_ = s.logEvent(ctx, tx, "info", "job.ack", req.WorkerID, req.JobID, map[string]any{
+			"from_status":  currentStatus,
+			"to_status":    currentStatus,
+			"assignment_id": req.AssignmentID,
+			"state":        "already_running",
+		})
 		return tx.Commit()
 	}
-	if status.String != hdcf.StatusAssigned {
-		return fmt.Errorf("job state not ackable: %s", status.String)
+	if currentStatus != hdcf.StatusAssigned {
+		return fmt.Errorf("job state not ackable: %s", currentStatus)
 	}
 	if strings.TrimSpace(req.WorkerID) == "" {
 		return fmt.Errorf("worker_id required")
@@ -844,6 +1097,11 @@ func (s *Store) AcknowledgeJob(ctx context.Context, req hdcf.AckJobRequest) erro
 	if err != nil {
 		return err
 	}
+	_ = s.logEvent(ctx, tx, "info", "job.ack", req.WorkerID, req.JobID, map[string]any{
+		"from_status":  currentStatus,
+		"to_status":    hdcf.StatusRunning,
+		"assignment_id": req.AssignmentID,
+	})
 	return tx.Commit()
 }
 
@@ -919,6 +1177,11 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 						Action: hdcf.ReconnectActionKeepCurrentJob,
 						Result: hdcf.ReconnectResultAccepted,
 					})
+					_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
+						"action":   "keep_current_job",
+						"status":   status.String,
+						"worker_id": req.WorkerID,
+					})
 				} else {
 					if _, err := tx.ExecContext(
 						ctx,
@@ -930,6 +1193,12 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 					); err != nil {
 						return nil, err
 					}
+					_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
+						"action":   "reassign_to_lost",
+						"from_status": hdcf.StatusRunning,
+						"to_status":   hdcf.StatusLost,
+						"owner_id":     ownerID,
+					})
 					actions = append(actions, hdcf.ReconnectAction{
 						JobID:  currentJobID,
 						Action: hdcf.ReconnectActionClearCurrentJob,
@@ -947,6 +1216,11 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 						Action: hdcf.ReconnectActionKeepCurrentJob,
 						Result: hdcf.ReconnectResultAccepted,
 					})
+					_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
+						"action":   "keep_current_job",
+						"status":   status.String,
+						"worker_id": req.WorkerID,
+					})
 				} else {
 					if _, err := tx.ExecContext(
 						ctx,
@@ -958,6 +1232,12 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 					); err != nil {
 						return nil, err
 					}
+					_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
+						"action":    "reassign_to_pending",
+						"from_status": hdcf.StatusAssigned,
+						"to_status":   hdcf.StatusPending,
+						"owner_id":    ownerID,
+					})
 					actions = append(actions, hdcf.ReconnectAction{
 						JobID:  currentJobID,
 						Action: hdcf.ReconnectActionClearCurrentJob,
@@ -974,12 +1254,21 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 					Action: hdcf.ReconnectActionClearCurrentJob,
 					Result: hdcf.ReconnectResultAccepted,
 				})
+				_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
+					"action": "clear_current_job",
+					"status": status.String,
+				})
 				if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, req.WorkerID); err != nil {
 					return nil, err
 				}
 			}
 		}
 	}
+
+	_ = s.logEvent(ctx, tx, "info", "worker.reconnect", req.WorkerID, "", map[string]any{
+		"current_job_id": currentJobID,
+		"replay_count":  len(req.CompletedJobs),
+	})
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -1054,21 +1343,54 @@ func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) 
 	if workerID == "" {
 		return fmt.Errorf("worker_id required")
 	}
+	var lastSeq sql.NullInt64
+	var status sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT heartbeat_seq, status FROM workers WHERE worker_id = ?`, workerID).Scan(&lastSeq, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("worker not registered")
+		}
+		return err
+	}
+	prevStatus := strings.TrimSpace(status.String)
+	if req.Sequence > 0 && lastSeq.Valid && req.Sequence <= lastSeq.Int64 {
+		_ = s.logEvent(ctx, nil, "debug", "worker.heartbeat_stale", workerID, "", map[string]any{
+			"seq": req.Sequence,
+		})
+		return nil
+	}
+
 	var currentJob interface{}
 	if req.CurrentJobID == nil || strings.TrimSpace(*req.CurrentJobID) == "" {
 		currentJob = nil
 	} else {
 		currentJob = *req.CurrentJobID
 	}
-	res, err := s.db.ExecContext(
-		ctx,
-		`UPDATE workers
-		 SET last_seen = ?, current_job_id = ?, status = 'ONLINE'
-		 WHERE worker_id = ?`,
-		now,
-		currentJob,
-		workerID,
-	)
+
+	var res sql.Result
+	var err error
+	if req.Sequence > 0 {
+		res, err = s.db.ExecContext(
+			ctx,
+			`UPDATE workers
+			 SET last_seen = ?, current_job_id = ?, status = 'ONLINE', heartbeat_seq = ?
+			 WHERE worker_id = ? AND heartbeat_seq < ?`,
+			now,
+			currentJob,
+			req.Sequence,
+			workerID,
+			req.Sequence,
+		)
+	} else {
+		res, err = s.db.ExecContext(
+			ctx,
+			`UPDATE workers
+			 SET last_seen = ?, current_job_id = ?, status = 'ONLINE'
+			 WHERE worker_id = ?`,
+			now,
+			currentJob,
+			workerID,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -1077,7 +1399,20 @@ func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) 
 		return err
 	}
 	if affected == 0 {
+		if req.Sequence > 0 {
+			_ = s.logEvent(ctx, nil, "debug", "worker.heartbeat_noop", workerID, "", map[string]any{
+				"seq": req.Sequence,
+			})
+			return nil
+		}
 		return fmt.Errorf("worker not registered")
+	}
+	if prevStatus != "ONLINE" {
+		_ = s.logEvent(ctx, nil, "info", "worker.heartbeat", workerID, "", map[string]any{
+			"from_status": prevStatus,
+			"to_status":   "ONLINE",
+			"seq":         req.Sequence,
+		})
 	}
 	return nil
 }
@@ -1092,25 +1427,50 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	defer tx.Rollback()
 
 	var status, workerID, assignmentID sql.NullString
-	errScan := tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id FROM jobs WHERE id = ?`, req.JobID).
-		Scan(&status, &workerID, &assignmentID)
+	var completionSeq sql.NullInt64
+	errScan := tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id, completion_seq FROM jobs WHERE id = ?`, req.JobID).
+		Scan(&status, &workerID, &assignmentID, &completionSeq)
 	if errScan != nil {
 		if errors.Is(errScan, sql.ErrNoRows) {
 			return fmt.Errorf("job not found")
 		}
 		return errScan
 	}
-	if status.String == hdcf.StatusCompleted {
+	currentStatus := strings.TrimSpace(status.String)
+	if currentStatus == hdcf.StatusCompleted {
+		_ = s.logEvent(ctx, tx, "info", "job.complete", req.WorkerID, req.JobID, map[string]any{
+			"from_status": currentStatus,
+			"to_status":   currentStatus,
+			"assignment_id": req.AssignmentID,
+			"state":        "noop_terminal",
+		})
 		return tx.Commit()
 	}
-	if status.String == hdcf.StatusFailed {
+	if currentStatus == hdcf.StatusFailed {
+		_ = s.logEvent(ctx, tx, "info", "job.complete", req.WorkerID, req.JobID, map[string]any{
+			"from_status": currentStatus,
+			"to_status":   currentStatus,
+			"assignment_id": req.AssignmentID,
+			"state":        "noop_terminal",
+		})
 		return tx.Commit()
 	}
-	if status.String != hdcf.StatusRunning {
-		return fmt.Errorf("job state not completable: %s", status.String)
+	if req.CompletionSeq > 0 && completionSeq.Valid && req.CompletionSeq <= completionSeq.Int64 {
+		_ = s.logEvent(ctx, tx, "info", "job.complete", req.WorkerID, req.JobID, map[string]any{
+			"from_status":       currentStatus,
+			"to_status":         currentStatus,
+			"assignment_id":     req.AssignmentID,
+			"completion_seq":    req.CompletionSeq,
+			"last_completion_seq": completionSeq.Int64,
+			"state":             "stale_completion",
+		})
+		return tx.Commit()
 	}
-	if !hdcf.IsValidTransition(status.String, hdcf.StatusCompleted) {
-		return fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusCompleted)
+	if currentStatus != hdcf.StatusRunning {
+		return fmt.Errorf("job state not completable: %s", currentStatus)
+	}
+	if !hdcf.IsValidTransition(currentStatus, hdcf.StatusCompleted) {
+		return fmt.Errorf("invalid transition %s -> %s", currentStatus, hdcf.StatusCompleted)
 	}
 	if strings.TrimSpace(req.ArtifactID) == "" {
 		return fmt.Errorf("artifact_id required")
@@ -1146,27 +1506,60 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 		return fmt.Errorf("assignment_id mismatch")
 	}
 
-	_, err = tx.ExecContext(
-		ctx,
-		`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
-		 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
-		hdcf.StatusCompleted,
-		req.StdoutPath,
-		req.ArtifactID,
-		req.StdoutTmpPath,
-		req.StdoutPath,
-		req.StdoutSHA256,
-		req.StderrTmpPath,
-		req.StderrPath,
-		req.StderrSHA256,
-		req.ResultSummary,
-		time.Now().Unix(),
-		req.WorkerID,
-		req.JobID,
-	)
+	if req.CompletionSeq > 0 {
+		_, err = tx.ExecContext(
+			ctx,
+			`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
+			 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, completion_seq = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+			hdcf.StatusCompleted,
+			req.StdoutPath,
+			req.ArtifactID,
+			req.StdoutTmpPath,
+			req.StdoutPath,
+			req.StdoutSHA256,
+			req.StderrTmpPath,
+			req.StderrPath,
+			req.StderrSHA256,
+			req.CompletionSeq,
+			req.ResultSummary,
+			time.Now().Unix(),
+			req.WorkerID,
+			req.JobID,
+		)
+	} else {
+		_, err = tx.ExecContext(
+			ctx,
+			`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
+			 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+			hdcf.StatusCompleted,
+			req.StdoutPath,
+			req.ArtifactID,
+			req.StdoutTmpPath,
+			req.StdoutPath,
+			req.StdoutSHA256,
+			req.StderrTmpPath,
+			req.StderrPath,
+			req.StderrSHA256,
+			req.ResultSummary,
+			time.Now().Unix(),
+			req.WorkerID,
+			req.JobID,
+		)
+	}
 	if err != nil {
 		return err
 	}
+	_ = s.logEvent(ctx, tx, "info", "job.complete", req.WorkerID, req.JobID, map[string]any{
+		"from_status":         currentStatus,
+		"to_status":           hdcf.StatusCompleted,
+		"assignment_id":       req.AssignmentID,
+		"artifact_id":         req.ArtifactID,
+		"completion_seq":      req.CompletionSeq,
+		"stdout":              req.StdoutPath,
+		"stderr":              req.StderrPath,
+		"stdout_sha256":       req.StdoutSHA256,
+		"stderr_sha256":       req.StderrSHA256,
+	})
 	return tx.Commit()
 }
 
@@ -1207,17 +1600,30 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 		}
 		return err
 	}
-	if status.String == hdcf.StatusCompleted {
+	currentStatus := strings.TrimSpace(status.String)
+	if currentStatus == hdcf.StatusCompleted {
+		_ = s.logEvent(ctx, tx, "info", "job.fail", req.WorkerID, req.JobID, map[string]any{
+			"from_status": currentStatus,
+			"to_status":   currentStatus,
+			"assignment_id": req.AssignmentID,
+			"state":        "noop_terminal",
+		})
 		return tx.Commit()
 	}
-	if status.String == hdcf.StatusFailed {
+	if currentStatus == hdcf.StatusFailed {
+		_ = s.logEvent(ctx, tx, "info", "job.fail", req.WorkerID, req.JobID, map[string]any{
+			"from_status": currentStatus,
+			"to_status":   currentStatus,
+			"assignment_id": req.AssignmentID,
+			"state":        "noop_terminal",
+		})
 		return tx.Commit()
 	}
-	if status.String != hdcf.StatusRunning {
-		return fmt.Errorf("job state not fail-safe: %s", status.String)
+	if currentStatus != hdcf.StatusRunning {
+		return fmt.Errorf("job state not fail-safe: %s", currentStatus)
 	}
-	if !hdcf.IsValidTransition(status.String, hdcf.StatusFailed) {
-		return fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusFailed)
+	if !hdcf.IsValidTransition(currentStatus, hdcf.StatusFailed) {
+		return fmt.Errorf("invalid transition %s -> %s", currentStatus, hdcf.StatusFailed)
 	}
 	if strings.TrimSpace(req.WorkerID) != "" && workerID.Valid && workerID.String != req.WorkerID {
 		return fmt.Errorf("job worker mismatch for failure")
@@ -1249,6 +1655,13 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 	if err != nil {
 		return err
 	}
+	_ = s.logEvent(ctx, tx, "info", "job.fail", req.WorkerID, req.JobID, map[string]any{
+		"from_status":   currentStatus,
+		"to_status":     nextStatus,
+		"assignment_id": req.AssignmentID,
+		"exit_code":     req.ExitCode,
+		"error":         req.Error,
+	})
 	return tx.Commit()
 }
 
@@ -1288,9 +1701,20 @@ func (s *Store) AbortJobs(ctx context.Context, req hdcf.AbortRequest) (int64, er
 			return 0, fmt.Errorf("job status missing")
 		}
 		if status.String == hdcf.StatusCompleted {
+			_ = s.logEvent(ctx, tx, "warn", "job.abort", "", jobID, map[string]any{
+				"from_status": status.String,
+				"to_status":   status.String,
+				"state":       "reject_completed",
+				"reason":      reason,
+			})
 			return 0, ErrAbortCompleted
 		}
 		if status.String == hdcf.StatusAborted {
+			_ = s.logEvent(ctx, tx, "info", "job.abort", "", jobID, map[string]any{
+				"from_status": status.String,
+				"to_status":   status.String,
+				"state":       "noop",
+			})
 			return 1, tx.Commit()
 		}
 		if !hdcf.IsValidTransition(status.String, hdcf.StatusAborted) {
@@ -1323,6 +1747,11 @@ func (s *Store) AbortJobs(ctx context.Context, req hdcf.AbortRequest) (int64, er
 				return 0, err
 			}
 		}
+		_ = s.logEvent(ctx, tx, "info", "job.abort", "", jobID, map[string]any{
+			"from_status": status.String,
+			"to_status":   hdcf.StatusAborted,
+			"reason":      reason,
+		})
 		return affected, tx.Commit()
 	}
 
@@ -1352,6 +1781,12 @@ func (s *Store) AbortJobs(ctx context.Context, req hdcf.AbortRequest) (int64, er
 	if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, workerID); err != nil {
 		return 0, err
 	}
+	_ = s.logEvent(ctx, tx, "info", "job.abort", "", "", map[string]any{
+		"worker_id":   workerID,
+		"to_status":   hdcf.StatusAborted,
+		"count":       affected,
+		"reason":      reason,
+	})
 
 	return affected, tx.Commit()
 }
@@ -1368,15 +1803,25 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(
+	res, err := tx.ExecContext(
 		ctx,
 		`UPDATE workers SET status = 'OFFLINE' WHERE status = 'ONLINE' AND last_seen < ?`,
 		cutoff,
 	); err != nil {
 		return err
 	}
+	offlineWorkers, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if offlineWorkers > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.offline_workers", "", "", map[string]any{
+			"count": offlineWorkers,
+			"cutoff": cutoff,
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'LOST',
@@ -1396,8 +1841,20 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	lostFromRunningOffline, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if lostFromRunningOffline > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.running_to_lost", "", "", map[string]any{
+			"count": lostFromRunningOffline,
+			"cutoff": cutoff,
+			"from": hdcf.StatusRunning,
+			"to": hdcf.StatusLost,
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'LOST',
@@ -1412,8 +1869,21 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	lostFromRunningMissing, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if lostFromRunningMissing > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.running_to_lost", "", "", map[string]any{
+			"count": lostFromRunningMissing,
+			"cutoff": cutoff,
+			"from": hdcf.StatusRunning,
+			"to": hdcf.StatusLost,
+			"reason": "missing_worker_record",
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'PENDING',
@@ -1431,8 +1901,20 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	pendingFromAssignedMissing, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if pendingFromAssignedMissing > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.assigned_to_pending", "", "", map[string]any{
+			"count": pendingFromAssignedMissing,
+			"from": hdcf.StatusAssigned,
+			"to": hdcf.StatusPending,
+			"reason": "missing_worker_record",
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'RETRYING',
@@ -1445,8 +1927,20 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	lostToRetrying, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if lostToRetrying > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.lost_to_retrying", "", "", map[string]any{
+			"count": lostToRetrying,
+			"from": hdcf.StatusLost,
+			"to": hdcf.StatusRetrying,
+			"retry_cutoff": lostRetryCutoff,
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'PENDING',
@@ -1463,8 +1957,21 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	assignedExpiredToPending, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if assignedExpiredToPending > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.assigned_to_pending", "", "", map[string]any{
+			"count": assignedExpiredToPending,
+			"from": hdcf.StatusAssigned,
+			"to": hdcf.StatusPending,
+			"reason": "assignment_expired",
+			"cutoff": cutoff,
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'PENDING',
@@ -1481,8 +1988,20 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	retryingToPending, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if retryingToPending > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.retrying_to_pending", "", "", map[string]any{
+			"count": retryingToPending,
+			"from": hdcf.StatusRetrying,
+			"to": hdcf.StatusPending,
+			"retry_cutoff": lostRetryCutoff,
+		})
+	}
 
-	if _, err := tx.ExecContext(
+	res, err = tx.ExecContext(
 		ctx,
 		`UPDATE jobs
 		 SET status = 'FAILED',
@@ -1499,6 +2018,19 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		lostRetryCutoff,
 	); err != nil {
 		return err
+	}
+	retryingToFailed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if retryingToFailed > 0 {
+		_ = s.logEvent(ctx, tx, "warn", "reconciler.retrying_to_failed", "", "", map[string]any{
+			"count": retryingToFailed,
+			"from": hdcf.StatusRetrying,
+			"to": hdcf.StatusFailed,
+			"reason": "attempts_exhausted",
+			"retry_cutoff": lostRetryCutoff,
+		})
 	}
 
 	return tx.Commit()

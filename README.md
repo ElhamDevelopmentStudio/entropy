@@ -84,6 +84,7 @@ Advanced scheduling fields are accepted directly by the API as part of `POST /jo
 - `GET /workers`
 - `POST /complete`
 - `POST /fail`
+- `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `limit`)
 
 Queue ordering behavior:
 - `GET /next-job` claims from `PENDING` jobs by descending `priority`, then ascending `created_at`, then ascending `job_id`.
@@ -94,6 +95,8 @@ Read/observability behavior:
 - `GET /jobs` returns job list entries with state, timestamps, attempt counters, worker assignment, and heartbeat age for jobs with active workers.
 - `GET /jobs/{job_id}` returns a single job detail payload with the same fields.
 - `GET /workers` returns worker rows with heartbeat age in seconds.
+- `GET /events` returns durable control-plane structured events (filtered by component/event/worker/job with a default descending order and configurable limit).  
+  Use this as the primary recovery audit trail before touching the database directly.
 
 Abort behavior:
 
@@ -115,6 +118,10 @@ Completion safety behavior:
 - `POST /complete` stores artifact metadata in SQLite and rejects completion when artifact fields are incomplete or violate the temp/final naming contract.
 - On success, worker computes and reports SHA-256 checksums for stdout/stderr artifacts; the control plane persists them in job records.
 - `/complete` and `/fail` are idempotent for terminal states (`COMPLETED`/`FAILED`) and return success without state changes.
+- To avoid out-of-order mutation, worker heartbeats and completions now include monotonic sequence numbers:
+  - `heartbeat` payload includes `seq`.
+  - `complete` payload includes `completion_seq`.
+  - Control plane ignores stale heartbeats and stale completions when these fields indicate older messages.
 
 Reconnection behavior:
 
@@ -155,6 +162,8 @@ Tables:
     `artifact_stderr_sha256`, `updated_by`
 - `workers`:
   - `worker_id`, `last_seen`, `current_job_id`, `status`, `registered_at`, `registration_nonce`, `worker_capabilities`
+- `audit_events`:
+  - `id`, `ts`, `component`, `level`, `event`, `request_id`, `worker_id`, `job_id`, `details`
 
 Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAILED`, `LOST`, `RETRYING`, `ABORTED` (SRS-complete core state machine is in place; advanced lifecycle transitions are being implemented by checklist).
 
