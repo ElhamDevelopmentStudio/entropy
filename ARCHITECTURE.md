@@ -2,6 +2,8 @@
 
 ## High-Level Model
 
+![Entropy control-plane and worker topology](assets/architecture-diagram.png)
+
 
 +-------------------+
 

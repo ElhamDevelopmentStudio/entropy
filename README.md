@@ -159,6 +159,8 @@ Entropy is particularly suited for:
 
 # Architecture Overview
 
+![Entropy distributed architecture](assets/architecture-diagram.png)
+
 See:
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [DESIGN_GUARANTEES.md](DESIGN_GUARANTEES.md)
