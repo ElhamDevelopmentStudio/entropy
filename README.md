@@ -55,12 +55,20 @@ The CLI sends `POST /jobs` and returns the new `job_id`.
 ## Implemented endpoints
 
 - `POST /jobs`
+- `POST /register`
 - `GET /next-job?worker_id=...`
 - `POST /ack`
 - `POST /heartbeat`
 - `POST /reconnect`
+- `POST /abort`
 - `POST /complete`
 - `POST /fail`
+
+Abort behavior:
+
+- `POST /abort` accepts `{ "job_id": "<id>" }`, `{ "worker_id": "<id>" }`, or both.
+- Optional `reason` field can be supplied and is persisted in the job `last_error` field.
+- Accepted transitions move a job to `ABORTED`, clear active assignment metadata, and clear the worker's current assignment.
 
 ACK flow behavior:
 
@@ -89,6 +97,12 @@ Reconnection behavior:
 Worker startup options:
 
 - `-state-file` (default `<log-dir>/worker-state.json`) for persisted reconnect replay data.
+- `-worker-nonce` (optional) optional registration nonce that must match CP for the same `worker_id`.
+
+Worker startup flow now includes:
+- `POST /register` with `worker_id` (and optional `nonce`)
+- `POST /reconnect`
+- normal heartbeat/ack/complete/fail flow
 
 On startup, the control plane now performs one reconciliation sweep immediately (in addition to the periodic reconciler) to recover stale assignments and worker state after a restart.
 
@@ -103,7 +117,7 @@ Tables:
     `artifact_stdout_sha256`, `artifact_stderr_tmp_path`, `artifact_stderr_path`,
     `artifact_stderr_sha256`, `updated_by`
 - `workers`:
-  - `worker_id`, `last_seen`, `current_job_id`, `status`
+  - `worker_id`, `last_seen`, `current_job_id`, `status`, `registered_at`, `registration_nonce`
 
 Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAILED`, `LOST`, `RETRYING`, `ABORTED` (SRS-complete core state machine is in place; advanced lifecycle transitions are being implemented by checklist).
 

@@ -119,6 +119,11 @@ type HeartbeatRequest struct {
 	Timestamp    string  `json:"ts"`
 }
 
+type RegisterWorkerRequest struct {
+	WorkerID string `json:"worker_id"`
+	Nonce    string `json:"nonce"`
+}
+
 type AckJobRequest struct {
 	JobID        string `json:"job_id"`
 	WorkerID     string `json:"worker_id"`
@@ -146,6 +151,12 @@ type FailRequest struct {
 	AssignmentID string `json:"assignment_id"`
 	ExitCode    int    `json:"exit_code"`
 	Error       string `json:"error"`
+}
+
+type AbortRequest struct {
+	JobID    string `json:"job_id"`
+	WorkerID string `json:"worker_id"`
+	Reason   string `json:"reason"`
 }
 
 type ReconnectCompletedJob struct {

@@ -19,6 +19,12 @@ type Store struct {
 	heartbeatTimeout time.Duration
 }
 
+var (
+	ErrAbortNoTarget       = errors.New("job_id or worker_id required")
+	ErrAbortWorkerMismatch = errors.New("worker_id mismatch")
+	ErrAbortCompleted      = errors.New("cannot abort completed job")
+)
+
 func Open(path string, heartbeatTimeout time.Duration) (*Store, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
@@ -77,14 +83,19 @@ func (s *Store) initSchema(ctx context.Context) error {
 		worker_id TEXT PRIMARY KEY,
 		last_seen INTEGER NOT NULL,
 		current_job_id TEXT,
-		status TEXT NOT NULL
+		status TEXT NOT NULL,
+		registered_at INTEGER,
+		registration_nonce TEXT
 	);
 	`
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
 		return err
 	}
-	return s.ensureJobColumns(ctx)
+	if err := s.ensureJobColumns(ctx); err != nil {
+		return err
+	}
+	return s.ensureWorkerColumns(ctx)
 }
 
 func (s *Store) ensureJobColumns(ctx context.Context) error {
@@ -136,6 +147,48 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) ensureWorkerColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(workers)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	columns := map[string]struct{}{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	type columnDef struct {
+		name string
+		ddl  string
+	}
+	need := []columnDef{
+		{name: "registered_at", ddl: "ALTER TABLE workers ADD COLUMN registered_at INTEGER"},
+		{name: "registration_nonce", ddl: "ALTER TABLE workers ADD COLUMN registration_nonce TEXT"},
+	}
+	for _, col := range need {
+		if _, ok := columns[col.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.CreateJobResponse, error) {
 	if strings.TrimSpace(req.Command) == "" {
 		return hdcf.CreateJobResponse{}, errors.New("command required")
@@ -173,6 +226,70 @@ func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.
 		JobID:  id,
 		Status: hdcf.StatusPending,
 	}, nil
+}
+
+func (s *Store) IsWorkerRegistered(ctx context.Context, workerID string) (bool, error) {
+	id := strings.TrimSpace(workerID)
+	if id == "" {
+		return false, nil
+	}
+
+	var found string
+	if err := s.db.QueryRowContext(ctx, `SELECT worker_id FROM workers WHERE worker_id = ?`, id).Scan(&found); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) RegisterWorker(ctx context.Context, req hdcf.RegisterWorkerRequest) error {
+	workerID := strings.TrimSpace(req.WorkerID)
+	if workerID == "" {
+		return fmt.Errorf("worker_id required")
+	}
+	nonce := strings.TrimSpace(req.Nonce)
+	now := time.Now().Unix()
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var existingNonce sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT registration_nonce FROM workers WHERE worker_id = ?`, workerID).Scan(&existingNonce); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	} else if nonce != "" && existingNonce.Valid && strings.TrimSpace(existingNonce.String) != "" && existingNonce.String != nonce {
+		return fmt.Errorf("registration nonce mismatch")
+	}
+
+	_, err = tx.ExecContext(
+		ctx,
+		`INSERT INTO workers (worker_id, last_seen, current_job_id, status, registered_at, registration_nonce)
+		 VALUES (?, ?, NULL, 'ONLINE', ?, ?)
+		 ON CONFLICT(worker_id) DO UPDATE SET
+		   last_seen = excluded.last_seen,
+		   status = 'ONLINE',
+		   registered_at = excluded.registered_at,
+		   registration_nonce = CASE
+		      WHEN NULLIF(excluded.registration_nonce, '') IS NULL THEN workers.registration_nonce
+		      ELSE excluded.registration_nonce
+		   END`,
+		workerID,
+		now,
+		now,
+		nonce,
+	)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.AssignedJob, bool, error) {
@@ -344,6 +461,7 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 	if strings.TrimSpace(req.WorkerID) == "" {
 		return nil, fmt.Errorf("worker_id required")
 	}
+	workerID := strings.TrimSpace(req.WorkerID)
 
 	actions := make([]hdcf.ReconnectAction, 0, 4+len(req.CompletedJobs))
 
@@ -365,17 +483,22 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 		currentJob = currentJobID
 	}
 
+	var existingWorker sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT worker_id FROM workers WHERE worker_id = ?`, workerID).Scan(&existingWorker); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("worker not registered")
+		}
+		return nil, err
+	}
+
 	if _, err := tx.ExecContext(
 		ctx,
-		`INSERT INTO workers (worker_id, last_seen, current_job_id, status)
-		 VALUES (?, ?, ?, 'ONLINE')
-		 ON CONFLICT(worker_id) DO UPDATE SET
-		   last_seen = excluded.last_seen,
-		   current_job_id = excluded.current_job_id,
-		   status = 'ONLINE'`,
-		req.WorkerID,
+		`UPDATE workers
+		 SET last_seen = ?, current_job_id = ?, status = 'ONLINE'
+		 WHERE worker_id = ?`,
 		now,
 		currentJob,
+		workerID,
 	); err != nil {
 		return nil, err
 	}
@@ -537,25 +660,36 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 
 func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) error {
 	now := time.Now().Unix()
+	workerID := strings.TrimSpace(req.WorkerID)
+	if workerID == "" {
+		return fmt.Errorf("worker_id required")
+	}
 	var currentJob interface{}
 	if req.CurrentJobID == nil || strings.TrimSpace(*req.CurrentJobID) == "" {
 		currentJob = nil
 	} else {
 		currentJob = *req.CurrentJobID
 	}
-	_, err := s.db.ExecContext(
+	res, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO workers (worker_id, last_seen, current_job_id, status)
-		 VALUES (?, ?, ?, 'ONLINE')
-		 ON CONFLICT(worker_id) DO UPDATE SET
-		   last_seen = excluded.last_seen,
-		   current_job_id = excluded.current_job_id,
-		   status = 'ONLINE'`,
-		req.WorkerID,
+		`UPDATE workers
+		 SET last_seen = ?, current_job_id = ?, status = 'ONLINE'
+		 WHERE worker_id = ?`,
 		now,
 		currentJob,
+		workerID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("worker not registered")
+	}
+	return nil
 }
 
 func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error {
@@ -726,6 +860,110 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) AbortJobs(ctx context.Context, req hdcf.AbortRequest) (int64, error) {
+	jobID := strings.TrimSpace(req.JobID)
+	workerID := strings.TrimSpace(req.WorkerID)
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "aborted"
+	}
+	if jobID == "" && workerID == "" {
+		return 0, ErrAbortNoTarget
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Unix()
+	if jobID != "" {
+		var status, owner sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT status, worker_id FROM jobs WHERE id = ?`, jobID).Scan(&status, &owner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, fmt.Errorf("job not found")
+			}
+			return 0, err
+		}
+		ownerID := strings.TrimSpace(owner.String)
+		if workerID != "" && ownerID != "" && ownerID != workerID {
+			return 0, ErrAbortWorkerMismatch
+		}
+		if !status.Valid {
+			return 0, fmt.Errorf("job status missing")
+		}
+		if status.String == hdcf.StatusCompleted {
+			return 0, ErrAbortCompleted
+		}
+		if status.String == hdcf.StatusAborted {
+			return 1, tx.Commit()
+		}
+		if !hdcf.IsValidTransition(status.String, hdcf.StatusAborted) {
+			return 0, fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusAborted)
+		}
+		res, err := tx.ExecContext(
+			ctx,
+			`UPDATE jobs
+			 SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
+			     last_error = ?, updated_by = 'abort', updated_at = ?
+			 WHERE id = ? AND status = ?`,
+			hdcf.StatusAborted,
+			reason,
+			now,
+			jobID,
+			status.String,
+		)
+		if err != nil {
+			return 0, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if affected == 0 {
+			return 0, fmt.Errorf("job state changed during abort request")
+		}
+		if ownerID != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ? AND current_job_id = ?`, ownerID, jobID); err != nil {
+				return 0, err
+			}
+		}
+		return affected, tx.Commit()
+	}
+
+	res, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
+		 SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
+		     last_error = ?, updated_by = 'abort', updated_at = ?
+		 WHERE worker_id = ? AND status NOT IN (?, ?)`,
+		hdcf.StatusAborted,
+		reason,
+		now,
+		workerID,
+		hdcf.StatusCompleted,
+		hdcf.StatusAborted,
+	)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected == 0 {
+		return 0, ErrAbortNoTarget
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workers SET current_job_id = NULL WHERE worker_id = ?`, workerID); err != nil {
+		return 0, err
+	}
+
+	return affected, tx.Commit()
 }
 
 func (s *Store) RecoverStaleWorkers(ctx context.Context) error {

@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -37,10 +39,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jobs", withAuth(cfg.apiToken, createJob(s)))
+	mux.HandleFunc("/register", withAuth(cfg.apiToken, registerWorker(s)))
 	mux.HandleFunc("/next-job", withAuth(cfg.apiToken, nextJob(s)))
 	mux.HandleFunc("/ack", withAuth(cfg.apiToken, ackJob(s)))
 	mux.HandleFunc("/heartbeat", withAuth(cfg.apiToken, heartbeat(s)))
 	mux.HandleFunc("/reconnect", withAuth(cfg.apiToken, reconnectWorker(s)))
+	mux.HandleFunc("/abort", withAuth(cfg.apiToken, abortJob(s)))
 	mux.HandleFunc("/complete", withAuth(cfg.apiToken, completeJob(s)))
 	mux.HandleFunc("/fail", withAuth(cfg.apiToken, failJob(s)))
 
@@ -121,15 +125,43 @@ func createJob(s *store.Store) http.HandlerFunc {
 	}
 }
 
+func registerWorker(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req hdcf.RegisterWorkerRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			return
+		}
+		workerID := strings.TrimSpace(req.WorkerID)
+		if workerID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
+			return
+		}
+		req.WorkerID = workerID
+		if err := s.RegisterWorker(r.Context(), req); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "worker_id": workerID})
+	}
+}
+
 func nextJob(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
-		workerID := r.URL.Query().Get("worker_id")
-		if strings.TrimSpace(workerID) == "" {
+		workerID := strings.TrimSpace(r.URL.Query().Get("worker_id"))
+		if workerID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
+			return
+		}
+		if err := requireRegisteredWorker(r.Context(), s, workerID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 			return
 		}
 		job, ok, err := s.ClaimNextJob(r.Context(), workerID)
@@ -155,10 +187,16 @@ func ackJob(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.AssignmentID) == "" {
+		workerID := strings.TrimSpace(req.WorkerID)
+		if strings.TrimSpace(req.JobID) == "" || workerID == "" || strings.TrimSpace(req.AssignmentID) == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
 			return
 		}
+		if err := requireRegisteredWorker(r.Context(), s, workerID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		req.WorkerID = workerID
 		if err := s.AcknowledgeJob(r.Context(), req); err != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
@@ -177,10 +215,16 @@ func heartbeat(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.WorkerID) == "" {
+		workerID := strings.TrimSpace(req.WorkerID)
+		if workerID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
 			return
 		}
+		if err := requireRegisteredWorker(r.Context(), s, workerID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		req.WorkerID = workerID
 		if err := s.RecordHeartbeat(r.Context(), req); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -199,10 +243,16 @@ func reconnectWorker(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.WorkerID) == "" {
+		workerID := strings.TrimSpace(req.WorkerID)
+		if workerID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
 			return
 		}
+		if err := requireRegisteredWorker(r.Context(), s, workerID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		req.WorkerID = workerID
 		actions, err := s.ReconnectWorker(r.Context(), req)
 		if err != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -212,6 +262,60 @@ func reconnectWorker(s *store.Store) http.HandlerFunc {
 			Status:  "ok",
 			Actions: actions,
 		})
+	}
+}
+
+func abortJob(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req hdcf.AbortRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			return
+		}
+		req.JobID = strings.TrimSpace(req.JobID)
+		req.WorkerID = strings.TrimSpace(req.WorkerID)
+		req.Reason = strings.TrimSpace(req.Reason)
+		if req.JobID == "" && req.WorkerID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id or worker_id required"})
+			return
+		}
+		aborted, err := s.AbortJobs(r.Context(), req)
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrAbortNoTarget):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			case errors.Is(err, store.ErrAbortWorkerMismatch), errors.Is(err, store.ErrAbortCompleted):
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			case err.Error() == "job not found":
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			case err.Error() == "job state changed during abort request":
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			default:
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		reason := req.Reason
+		if reason == "" {
+			reason = "aborted"
+		}
+		resp := map[string]interface{}{
+			"status":       hdcf.StatusAborted,
+			"aborted_jobs": aborted,
+			"reason":       reason,
+		}
+		if req.JobID != "" {
+			resp["job_id"] = req.JobID
+		}
+		if req.WorkerID != "" {
+			resp["worker_id"] = req.WorkerID
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -225,10 +329,16 @@ func completeJob(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.AssignmentID) == "" {
+		workerID := strings.TrimSpace(req.WorkerID)
+		if strings.TrimSpace(req.JobID) == "" || workerID == "" || strings.TrimSpace(req.AssignmentID) == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
 			return
 		}
+		if err := requireRegisteredWorker(r.Context(), s, workerID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		req.WorkerID = workerID
 		if err := s.CompleteJob(r.Context(), req); err != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
@@ -247,10 +357,16 @@ func failJob(s *store.Store) http.HandlerFunc {
 		if err := decodeJSON(w, r, &req); err != nil {
 			return
 		}
-		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.AssignmentID) == "" {
+		workerID := strings.TrimSpace(req.WorkerID)
+		if strings.TrimSpace(req.JobID) == "" || workerID == "" || strings.TrimSpace(req.AssignmentID) == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
 			return
 		}
+		if err := requireRegisteredWorker(r.Context(), s, workerID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		req.WorkerID = workerID
 		if err := s.FailJob(r.Context(), req); err != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
@@ -287,4 +403,15 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.Encode(payload)
+}
+
+func requireRegisteredWorker(ctx context.Context, s *store.Store, workerID string) error {
+	registered, err := s.IsWorkerRegistered(ctx, workerID)
+	if err != nil {
+		return err
+	}
+	if !registered {
+		return fmt.Errorf("worker_id not registered")
+	}
+	return nil
 }

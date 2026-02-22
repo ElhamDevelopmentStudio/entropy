@@ -155,18 +155,23 @@ Acceptance criteria:
 After CP restart, no job is stranded due to unflushed memory state.
 Dependency: P1-01, P1-03.
 
-9. `[ ]` P2-09 — Register worker identity and tighten LAN auth
+9. `[x]` P2-09 — Register worker identity and tighten LAN auth
 Requirement source: `SRS.md` Section 5.4
 Target: `cmd/control/main.go`, `cmd/worker/main.go`
 Implementation details:
 Add worker register endpoint with identity + optional nonce.
 Bind heartbeat and job operations to known `worker_id`.
 Keep current token auth and remove unauthenticated mutation paths.
+Progress:
+- Added `/register` endpoint with optional nonce.
+- Workers register on startup before reconnect.
+- Heartbeat, reconnect, `/next-job`, `/ack`, `/complete`, and `/fail` require pre-registered workers.
+- Added worker registration metadata (`registered_at`, `registration_nonce`) in schema.
 Acceptance criteria:
 Only registered/known workers can heartbeat or claim jobs.
 Dependency: P1-05.
 
-10. `[ ]` P2-10 — Add explicit abort workflow
+10. `[x]` P2-10 — Add explicit abort workflow
 Requirement source: `SRS.md` Section 4.1.1
 Target: `cmd/control/main.go`, `internal/store/store.go`
 Implementation details:
@@ -175,6 +180,10 @@ Transition to `ABORTED` and stop/revoke future retries.
 Acceptance criteria:
 Aborted jobs stop retrying and stay terminal unless intentionally restarted.
 Dependency: P1-01.
+Progress:
+- Added `POST /abort` with `job_id` and/or `worker_id` payload support.
+- Added `hdcf.AbortRequest` and `store.AbortJobs`.
+- Abort path rejects completed jobs, enforces explicit owner context when `job_id + worker_id` is provided, clears `worker.current_job_id`, and moves jobs to `ABORTED`.
 
 11. `[ ]` P2-11 — Add job read APIs for observability
 Requirement source: future operations from dashboard optional MVP
