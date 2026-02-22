@@ -2106,3 +2106,116 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 
 	return tx.Commit()
 }
+
+func (s *Store) ListTerminalArtifactPaths(ctx context.Context, retentionDays int) ([]string, error) {
+	if retentionDays <= 0 {
+		return nil, nil
+	}
+	cutoff := time.Now().Unix() - int64(retentionDays)*86400
+	query := `
+		SELECT artifact_stdout_path, artifact_stdout_tmp_path, artifact_stderr_path, artifact_stderr_tmp_path
+		FROM jobs
+		WHERE status IN ('COMPLETED', 'FAILED', 'ABORTED')
+		  AND updated_at < ?
+	`
+	return s.collectTerminalArtifactPaths(ctx, nil, query, cutoff)
+}
+
+func (s *Store) PruneTerminalJobs(ctx context.Context, retentionDays int) ([]string, int64, error) {
+	if retentionDays <= 0 {
+		return nil, 0, nil
+	}
+	cutoff := time.Now().Unix() - int64(retentionDays)*86400
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+
+	query := `
+		SELECT artifact_stdout_path, artifact_stdout_tmp_path, artifact_stderr_path, artifact_stderr_tmp_path
+		FROM jobs
+		WHERE status IN ('COMPLETED', 'FAILED', 'ABORTED')
+		  AND updated_at < ?
+	`
+	paths, err := s.collectTerminalArtifactPaths(ctx, tx, query, cutoff)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM jobs
+		WHERE status IN ('COMPLETED', 'FAILED', 'ABORTED')
+		  AND updated_at < ?
+	`, cutoff)
+	if err != nil {
+		return nil, 0, err
+	}
+	deletedJobs, err := res.RowsAffected()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	return paths, deletedJobs, nil
+}
+
+func (s *Store) CleanupOldEvents(ctx context.Context, retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Unix() - int64(retentionDays)*86400
+	res, err := s.db.ExecContext(ctx, `DELETE FROM audit_events WHERE ts < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	deletedEvents, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deletedEvents, nil
+}
+
+func (s *Store) collectTerminalArtifactPaths(ctx context.Context, tx *sql.Tx, query string, cutoff int64) ([]string, error) {
+	executeQuery := func(q string, args ...any) (*sql.Rows, error) {
+		if tx != nil {
+			return tx.QueryContext(ctx, q, args...)
+		}
+		return s.db.QueryContext(ctx, q, args...)
+	}
+
+	rows, err := executeQuery(query, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	pathSet := map[string]struct{}{}
+	for rows.Next() {
+		var stdoutPath, stdoutTmpPath, stderrPath, stderrTmpPath string
+		if err := rows.Scan(&stdoutPath, &stdoutTmpPath, &stderrPath, &stderrTmpPath); err != nil {
+			return nil, err
+		}
+		for _, p := range []string{stdoutPath, stdoutTmpPath, stderrPath, stderrTmpPath} {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			pathSet[p] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	paths := make([]string, 0, len(pathSet))
+	for p := range pathSet {
+		paths = append(paths, p)
+	}
+	return paths, nil
+}

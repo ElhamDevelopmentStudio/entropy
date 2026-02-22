@@ -34,8 +34,8 @@ Progress:
 - Dashboard renders live job list, worker list, and recent events with polling and optional filtering.
 - Added manual abort action in the UI and API-token persistence in browser local storage.
 
-2. `[ ]` P5-02 — Policy/retention engine for logs and artifacts
-Current status: no background lifecycle management yet
+2. `[x]` P5-02 — Policy/retention engine for logs and artifacts
+Current status: active scheduled cleanup on control plane and worker
 Target: scheduled cleaner job + policy config
 Implementation tasks:
 - Add config for retention windows:
@@ -50,6 +50,10 @@ Implementation tasks:
 Acceptance criteria:
 - Database and disk do not grow unbounded across long runs.
 - Cleanup does not delete non-terminal or active work unexpectedly.
+Progress:
+- Added periodic control-plane cleanup with configurable retention windows for terminal jobs, terminal artifacts, and events.
+- Added worker-side local artifact log cleanup policy with retention interval and skip for currently running job.
+- Added audit logging around cleanup passes and outcomes.
 
 3. `[ ]` P5-03 — Full transport security (TLS) and stronger auth
 Current status: static `X-API-Token` only

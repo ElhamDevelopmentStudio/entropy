@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,8 @@ func main() {
 		requestTimeout:    cfg.requestTimeout,
 		logDir:           cfg.logDir,
 		stateFile:        cfg.stateFile,
+		logRetentionDays:  cfg.logRetentionDays,
+		logCleanupInterval: cfg.logCleanupInterval,
 		reportMetrics:     cfg.reportMetrics,
 	}
 	if runner.logDir == "" {
@@ -84,6 +87,7 @@ func main() {
 		"control_endpoint": strings.TrimRight(cfg.controlURL, "/"),
 	})
 	go runner.heartbeatLoop(ctx)
+	go runner.logCleanupLoop(ctx)
 
 	runner.loop(ctx)
 }
@@ -99,6 +103,8 @@ type workerConfig struct {
 	requestTimeout    time.Duration
 	logDir            string
 	stateFile         string
+	logRetentionDays  int
+	logCleanupInterval time.Duration
 	reportMetrics     bool
 }
 
@@ -112,10 +118,14 @@ func parseWorkerConfig() workerConfig {
 	var pollSec int
 	var heartbeatSec int
 	var timeoutSec int
+	var logRetentionDays int
+	var logCleanupIntervalSec int
 	flag.IntVar(&pollSec, "poll-interval-seconds", 3, "poll interval seconds")
 	flag.IntVar(&heartbeatSec, "heartbeat-interval-seconds", 5, "heartbeat interval seconds")
 	flag.BoolVar(&cfg.reportMetrics, "heartbeat-metrics", false, "include optional resource metrics in heartbeat payload")
 	flag.IntVar(&timeoutSec, "request-timeout-seconds", 10, "request timeout seconds")
+	flag.IntVar(&logRetentionDays, "log-retention-days", int(getenvInt("HDCF_WORKER_LOG_RETENTION_DAYS", 30)), "days to retain worker local log/artifact files")
+	flag.IntVar(&logCleanupIntervalSec, "log-cleanup-interval-seconds", int(getenvInt("HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS", 300)), "log cleanup interval seconds")
 	flag.StringVar(&cfg.logDir, "log-dir", "worker-logs", "path for local job logs")
 	flag.StringVar(&cfg.stateFile, "state-file", "", "path to reconnect state file (default worker-logs/worker-state.json)")
 	flag.Parse()
@@ -123,6 +133,8 @@ func parseWorkerConfig() workerConfig {
 	cfg.pollInterval = time.Duration(pollSec) * time.Second
 	cfg.heartbeatInterval = time.Duration(heartbeatSec) * time.Second
 	cfg.requestTimeout = time.Duration(timeoutSec) * time.Second
+	cfg.logRetentionDays = logRetentionDays
+	cfg.logCleanupInterval = time.Duration(logCleanupIntervalSec) * time.Second
 	if strings.TrimSpace(cfg.workerID) == "" {
 		host, _ := os.Hostname()
 		cfg.workerID = fmt.Sprintf("%s-%s", host, hdcf.NewJobID())
@@ -140,6 +152,18 @@ func getenv(name, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func getenvInt(name string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func splitCapabilities(raw string) []string {
@@ -170,6 +194,8 @@ type workerRunner struct {
 	requestTimeout    time.Duration
 	logDir            string
 	stateFile         string
+	logRetentionDays   int
+	logCleanupInterval time.Duration
 	currentJobID      atomic.Value
 	httpClient        *http.Client
 	stateMu           sync.Mutex
@@ -321,6 +347,37 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 				})
 			}
 			ticker.Reset(jitterDuration(r.heartbeatInterval))
+		}
+	}
+}
+
+func (r *workerRunner) logCleanupLoop(ctx context.Context) {
+	if r.logRetentionDays <= 0 || r.logCleanupInterval <= 0 {
+		workerEvent("info", "worker.log_cleanup", map[string]any{
+			"worker_id": r.workerID,
+			"retention_days": r.logRetentionDays,
+			"interval_sec":  int(r.logCleanupInterval.Seconds()),
+			"status":        "disabled",
+		})
+		return
+	}
+
+	cleanupTicker := time.NewTicker(r.logCleanupInterval)
+	defer cleanupTicker.Stop()
+	_ = r.cleanupLogArtifacts()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cleanupTicker.C:
+			if err := r.cleanupLogArtifacts(); err != nil {
+				workerEvent("warn", "worker.log_cleanup", map[string]any{
+					"worker_id": r.workerID,
+					"status":    "failed",
+					"error":     err.Error(),
+				})
+			}
 		}
 	}
 }
@@ -1242,6 +1299,67 @@ func (r *workerRunner) handleJobFailure(ctx context.Context, job *hdcf.AssignedJ
 			"error":         "report_fail_retries_exhausted",
 		})
 	}
+}
+
+func (r *workerRunner) cleanupLogArtifacts() error {
+	if r.logRetentionDays <= 0 {
+		return nil
+	}
+	cutoff := time.Now().Add(-time.Duration(r.logRetentionDays) * 24 * time.Hour).Unix()
+	entries, err := os.ReadDir(r.logDir)
+	if err != nil {
+		return err
+	}
+	currentJob := ""
+	if v := r.getCurrentJobID(); v != nil {
+		if val, ok := v.(string); ok {
+			currentJob = strings.TrimSpace(val)
+		}
+	}
+
+	var deleted, failed int64
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !isWorkerLogArtifact(name) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			failed++
+			continue
+		}
+		if info.ModTime().Unix() >= cutoff {
+			continue
+		}
+		if currentJob != "" && strings.HasPrefix(name, currentJob+".") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(r.logDir, name)); err != nil {
+			failed++
+			continue
+		}
+		deleted++
+	}
+	if deleted > 0 || failed > 0 {
+		workerEvent("info", "worker.log_cleanup", map[string]any{
+			"worker_id":      r.workerID,
+			"retention_days": r.logRetentionDays,
+			"deleted":        deleted,
+			"failed":         failed,
+			"candidate_cutoff": cutoff,
+		})
+	}
+	return nil
+}
+
+func isWorkerLogArtifact(name string) bool {
+	return strings.HasSuffix(name, ".stdout.log") ||
+		strings.HasSuffix(name, ".stderr.log") ||
+		strings.HasSuffix(name, ".stdout.log.tmp") ||
+		strings.HasSuffix(name, ".stderr.log.tmp")
 }
 
 func retryWithBackoff(ctx context.Context, base time.Duration, fn func() error, attempts int) error {

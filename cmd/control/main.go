@@ -37,6 +37,10 @@ func main() {
 		"db_path":           cfg.dbPath,
 		"heartbeat_timeout":  int(cfg.heartbeatTimeout.Seconds()),
 		"reconcile_interval": int(cfg.reconcileInterval.Seconds()),
+		"cleanup_interval":   int(cfg.cleanupInterval.Seconds()),
+		"jobs_retention_completed_days": cfg.jobsRetentionCompletedDays,
+		"artifacts_retention_days":      cfg.artifactsRetentionDays,
+		"events_retention_days":          cfg.eventsRetentionDays,
 	})
 	recoverCtx := store.WithRequestID(ctx, hdcf.NewJobID())
 	if err := s.RecoverStaleWorkers(recoverCtx); err != nil {
@@ -50,6 +54,7 @@ func main() {
 	})
 
 	go runReconciler(ctx, s, cfg.reconcileInterval)
+	go runCleanup(ctx, s, cfg.cleanupInterval, cfg.jobsRetentionCompletedDays, cfg.artifactsRetentionDays, cfg.eventsRetentionDays)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ui", dashboardUI())
@@ -89,7 +94,7 @@ func dashboardUI() http.HandlerFunc {
 	}
 }
 
-const dashboardHTML = `<!doctype html>
+	const dashboardHTML = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -549,6 +554,10 @@ type controlConfig struct {
 	apiToken           string
 	heartbeatTimeout   time.Duration
 	reconcileInterval  time.Duration
+	cleanupInterval    time.Duration
+	jobsRetentionCompletedDays int
+	artifactsRetentionDays     int
+	eventsRetentionDays       int
 }
 
 func parseConfig() controlConfig {
@@ -558,11 +567,23 @@ func parseConfig() controlConfig {
 	flag.StringVar(&cfg.apiToken, "token", getenvDefault("HDCF_API_TOKEN", "dev-token"), "api token")
 	var heartbeatSec int64
 	var reconcileSec int64
+	var cleanupIntervalSec int64
+	var jobsRetentionCompletedDays int64
+	var artifactsRetentionDays int64
+	var eventsRetentionDays int64
 	flag.Int64Var(&heartbeatSec, "heartbeat-timeout-seconds", int64(getenvInt("HDCF_HEARTBEAT_TIMEOUT_SECONDS", 60)), "heartbeat timeout seconds")
 	flag.Int64Var(&reconcileSec, "reconcile-interval-seconds", int64(getenvInt("HDCF_RECONCILE_INTERVAL_SECONDS", 10)), "reconcile interval seconds")
+	flag.Int64Var(&cleanupIntervalSec, "cleanup-interval-seconds", getenvInt("HDCF_CLEANUP_INTERVAL_SECONDS", 300), "cleanup interval seconds")
+	flag.Int64Var(&jobsRetentionCompletedDays, "jobs-retention-completed-days", getenvInt("HDCF_JOBS_RETENTION_COMPLETED_DAYS", 30), "days to retain terminal jobs in sqlite")
+	flag.Int64Var(&artifactsRetentionDays, "artifacts-retention-days", getenvInt("HDCF_ARTIFACTS_RETENTION_DAYS", 14), "days to retain terminal artifact/log files (cleanup does not block scheduling)")
+	flag.Int64Var(&eventsRetentionDays, "events-retention-days", getenvInt("HDCF_EVENTS_RETENTION_DAYS", 30), "days to retain audit events")
 	flag.Parse()
 	cfg.heartbeatTimeout = time.Duration(heartbeatSec) * time.Second
 	cfg.reconcileInterval = time.Duration(reconcileSec) * time.Second
+	cfg.cleanupInterval = time.Duration(cleanupIntervalSec) * time.Second
+	cfg.jobsRetentionCompletedDays = int(jobsRetentionCompletedDays)
+	cfg.artifactsRetentionDays = int(artifactsRetentionDays)
+	cfg.eventsRetentionDays = int(eventsRetentionDays)
 	return cfg
 }
 
@@ -1367,6 +1388,137 @@ func runReconciler(ctx context.Context, s *store.Store, interval time.Duration) 
 			}
 		}
 	}
+}
+
+func runCleanup(ctx context.Context, s *store.Store, interval time.Duration, jobsRetentionDays, artifactsRetentionDays, eventsRetentionDays int) {
+	if interval <= 0 {
+		auditEvent("warn", "control.cleanup", "", map[string]any{
+			"status":  "disabled",
+			"reason":  "cleanup interval must be greater than zero",
+			"interval": interval.Seconds(),
+		})
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		runCleanupOnce(s, jobsRetentionDays, artifactsRetentionDays, eventsRetentionDays)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runCleanupOnce(s *store.Store, jobsRetentionDays, artifactsRetentionDays, eventsRetentionDays int) {
+	runID := hdcf.NewJobID()
+	runCtx := store.WithRequestID(context.Background(), runID)
+	var jobsDeleted, eventsDeleted int64
+	var pathsCandidate, pathsDeleted, pathsMissing, pathsFailed int64
+
+	if jobsRetentionDays <= 0 && artifactsRetentionDays <= 0 && eventsRetentionDays <= 0 {
+		auditEvent("info", "control.cleanup", runID, map[string]any{
+			"status": "skipped",
+			"reason": "retention policies disabled",
+		})
+		return
+	}
+
+	auditEvent("info", "control.cleanup", runID, map[string]any{
+		"status": "start",
+		"jobs_retention_days": jobsRetentionDays,
+		"artifacts_retention_days": artifactsRetentionDays,
+		"events_retention_days": eventsRetentionDays,
+	})
+
+	pathSet := map[string]struct{}{}
+	if jobsRetentionDays > 0 {
+		artifactPaths, deletedJobs, err := s.PruneTerminalJobs(runCtx, jobsRetentionDays)
+		if err != nil {
+			auditEvent("error", "control.cleanup_jobs", runID, map[string]any{
+				"status_code": http.StatusInternalServerError,
+				"error":       err.Error(),
+			})
+		} else {
+			jobsDeleted = deletedJobs
+			for _, path := range artifactPaths {
+				path = strings.TrimSpace(path)
+				if path == "" {
+					continue
+				}
+				pathSet[path] = struct{}{}
+			}
+		}
+	}
+
+	if artifactsRetentionDays > 0 {
+		artifactPaths, err := s.ListTerminalArtifactPaths(runCtx, artifactsRetentionDays)
+		if err != nil {
+			auditEvent("error", "control.cleanup_artifacts", runID, map[string]any{
+				"status_code": http.StatusInternalServerError,
+				"error":       err.Error(),
+			})
+		} else {
+			for _, path := range artifactPaths {
+				path = strings.TrimSpace(path)
+				if path == "" {
+					continue
+				}
+				pathSet[path] = struct{}{}
+			}
+		}
+	}
+
+	deleted, missing, failed := cleanupArtifactPaths(pathSet)
+	pathsCandidate = int64(len(pathSet))
+	pathsDeleted = deleted
+	pathsMissing = missing
+	pathsFailed = failed
+
+	if eventsRetentionDays > 0 {
+		deletedEvents, err := s.CleanupOldEvents(runCtx, eventsRetentionDays)
+		if err != nil {
+			auditEvent("error", "control.cleanup_events", runID, map[string]any{
+				"status_code": http.StatusInternalServerError,
+				"error":       err.Error(),
+			})
+		} else {
+			eventsDeleted = deletedEvents
+		}
+	}
+
+	auditEvent("info", "control.cleanup", runID, map[string]any{
+		"status": "complete",
+		"jobs_deleted":   jobsDeleted,
+		"events_deleted": eventsDeleted,
+		"paths_candidate": pathsCandidate,
+		"paths_deleted":  pathsDeleted,
+		"paths_missing":  pathsMissing,
+		"paths_failed":   pathsFailed,
+	})
+
+	if jobsDeleted == 0 && eventsDeleted == 0 && pathsCandidate == 0 && pathsFailed == 0 {
+		return
+	}
+}
+
+func cleanupArtifactPaths(paths map[string]struct{}) (int64, int64, int64) {
+	var deleted, missing, failed int64
+	for path := range paths {
+		if err := os.Remove(path); err != nil {
+			if os.IsNotExist(err) {
+				missing++
+				continue
+			}
+			failed++
+			continue
+		}
+		deleted++
+	}
+	return deleted, missing, failed
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst interface{}, requestID string) error {

@@ -23,6 +23,16 @@ Environment variables available:
 - `HDCF_API_TOKEN` (default `dev-token`)
 - `HDCF_HEARTBEAT_TIMEOUT_SECONDS` (default `60`)
 - `HDCF_RECONCILE_INTERVAL_SECONDS` (default `10`)
+- `HDCF_CLEANUP_INTERVAL_SECONDS` (default `300`)
+- `HDCF_JOBS_RETENTION_COMPLETED_DAYS` (default `30`)
+- `HDCF_ARTIFACTS_RETENTION_DAYS` (default `14`)
+- `HDCF_EVENTS_RETENTION_DAYS` (default `30`)
+
+Control-plane cleanup controls:
+- `-cleanup-interval-seconds` (how often retention sweeps run)
+- `-jobs-retention-completed-days` (how long terminal jobs stay in sqlite)
+- `-artifacts-retention-days` (how long terminal artifact paths are eligible for on-disk cleanup)
+- `-events-retention-days` (how long audit events are retained)
 
 ### 2) Start worker on ASUS
 
@@ -40,6 +50,8 @@ Worker options:
 - `-heartbeat-interval-seconds` (default `5`)
 - `-request-timeout-seconds` (default `10`)
 - `-log-dir` (default `worker-logs`)
+- `-log-retention-days` (default `30`)
+- `-log-cleanup-interval-seconds` (default `300`)
 - `-heartbeat-metrics` (default `false`) — include optional resource metrics in heartbeat payload
 
 Environment variables:
@@ -48,6 +60,17 @@ Environment variables:
 - `HDCF_WORKER_NONCE`
 - `HDCF_CONTROL_URL`
 - `HDCF_WORKER_ID`
+- `HDCF_WORKER_LOG_RETENTION_DAYS` (default `30`)
+- `HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS` (default `300`)
+
+Retention and cleanup behavior:
+- Control plane runs periodic retention sweeps on `-cleanup-interval-seconds`.
+- Control plane sweeps can:
+  - delete terminal jobs (`COMPLETED`, `FAILED`, `ABORTED`) older than `-jobs-retention-completed-days`;
+  - delete terminal job artifact file paths older than `-artifacts-retention-days`;
+  - delete audit events older than `-events-retention-days`;
+  - emit cleanup audit events (`control.cleanup*`) with counts and deletion outcomes.
+- Worker retains log/artifact files locally and periodically removes old artifacts via `log-retention-days`.
 
 ### 3) Submit a job
 
