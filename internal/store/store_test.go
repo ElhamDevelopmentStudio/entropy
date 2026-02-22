@@ -288,8 +288,26 @@ func TestRecoverStaleRunningJobIsReclaimedAndReassigned(t *testing.T) {
 		t.Fatalf("recover stale (retry window): %v", err)
 	}
 	job = mustGetJob(t, s, ctx, jobID)
+	if job.Status != hdcf.StatusRetrying {
+		t.Fatalf("expected retrying after retry window, got %s", job.Status)
+	}
+
+	_, err = s.db.ExecContext(
+		ctx,
+		`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+		time.Now().Unix()-5,
+		jobID,
+	)
+	if err != nil {
+		t.Fatalf("re-age retrying job: %v", err)
+	}
+
+	if err := s.RecoverStaleWorkers(ctx); err != nil {
+		t.Fatalf("recover stale (retry->pending): %v", err)
+	}
+	job = mustGetJob(t, s, ctx, jobID)
 	if job.Status != hdcf.StatusPending {
-		t.Fatalf("expected pending after retry window, got %s", job.Status)
+		t.Fatalf("expected pending after second recovery window, got %s", job.Status)
 	}
 
 	reassigned, ok, err := s.ClaimNextJob(ctx, "worker-b")

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -310,7 +311,7 @@ func NormalizeArtifactStorageBackend(raw string) string {
 	switch raw {
 	case "nfs-share", "nfs_share":
 		return ArtifactStorageBackendNFS
-	case "s3", "s3-compatible", "s3_compatible":
+	case "s3-compatible", "s3_compatible":
 		return ArtifactStorageBackendS3
 	case ArtifactStorageBackendLocal, ArtifactStorageBackendNFS, ArtifactStorageBackendS3:
 		return raw

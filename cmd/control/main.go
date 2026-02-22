@@ -403,7 +403,7 @@ func dashboardUI() http.HandlerFunc {
 
       function formatAge(sec) {
         if (sec == null) return 'n/a';
-        return `${sec}s`;
+        return sec + 's';
       }
 
       function shortId(id) {
@@ -425,23 +425,23 @@ func dashboardUI() http.HandlerFunc {
 
       function statusText(j) {
         if (!j.status) return '';
-        const age = j.heartbeat_age_sec == null ? '' : `, heartbeat ${formatAge(j.heartbeat_age_sec)}`;
-        return `${j.status}${age}`;
+        const age = j.heartbeat_age_sec == null ? '' : ', heartbeat ' + formatAge(j.heartbeat_age_sec);
+        return '' + j.status + age;
       }
 
       function metricsText(metrics) {
         const parts = [];
         if (metrics.cpu_usage_percent != null) {
-          parts.push(`CPU: ${Number(metrics.cpu_usage_percent).toFixed(1)}%`);
+          parts.push('CPU: ' + Number(metrics.cpu_usage_percent).toFixed(1) + '%');
         }
         if (metrics.memory_usage_mb != null) {
-          parts.push(`RAM: ${Number(metrics.memory_usage_mb).toFixed(1)}MB`);
+          parts.push('RAM: ' + Number(metrics.memory_usage_mb).toFixed(1) + 'MB');
         }
         if (metrics.gpu_usage_percent != null) {
-          parts.push(`GPU: ${Number(metrics.gpu_usage_percent).toFixed(1)}%`);
+          parts.push('GPU: ' + Number(metrics.gpu_usage_percent).toFixed(1) + '%');
         }
         if (metrics.gpu_memory_usage_mb != null) {
-          parts.push(`VRAM: ${Number(metrics.gpu_memory_usage_mb).toFixed(1)}MB`);
+          parts.push('VRAM: ' + Number(metrics.gpu_memory_usage_mb).toFixed(1) + 'MB');
         }
         return parts.length === 0 ? '-' : parts.join(' • ');
       }
@@ -449,45 +449,47 @@ func dashboardUI() http.HandlerFunc {
       function renderJobs(jobs) {
         jobsRows.innerHTML = jobs.map(j => {
           const terminal = ['COMPLETED', 'FAILED', 'ABORTED'].includes(j.status);
-          const action = terminal ? '' : `<button class="warn" onclick="abortJob('${j.job_id}')">Abort</button>`;
+          const action = terminal ? '' : '<button class="warn" onclick="abortJob(\'' + j.job_id + '\')">Abort</button>';
           const assignment = j.assignment_id ? shortId(j.assignment_id) : '';
-          return `<tr>
-            <td class="mono">${shortId(j.job_id)}</td>
-            <td><span class="pill ${pillClass(j.status)}">${statusText(j)}</span></td>
-            <td><div>${j.command}</div><div class="small mono">${(j.args || []).join(' ')}</div></td>
-            <td class="small mono">${j.worker_id || '-'} ${assignment ? `<span>/ ${assignment}</span>` : ''}</td>
-            <td>${j.attempt_count}/${j.max_attempts}</td>
-            <td><div>${formatEpoch(j.updated_at)}</div><div class="small">${j.last_error ? ('err: ' + j.last_error) : ''}</div></td>
-            <td>${action}</td>
-          </tr>`;
+          const worker = j.worker_id || '-';
+          const workerCell = worker + (assignment ? ' <span>/ ' + assignment + '</span>' : '');
+          return '<tr>' +
+            '<td class="mono">' + shortId(j.job_id) + '</td>' +
+            '<td><span class="pill ' + pillClass(j.status) + '">' + statusText(j) + '</span></td>' +
+            '<td><div>' + (j.command || '') + '</div><div class="small mono">' + ((j.args || []).join(' ')) + '</div></td>' +
+            '<td class="small mono">' + workerCell + '</td>' +
+            '<td>' + j.attempt_count + '/' + j.max_attempts + '</td>' +
+            '<td><div>' + formatEpoch(j.updated_at) + '</div><div class="small">' + (j.last_error ? ('err: ' + j.last_error) : '') + '</div></td>' +
+            '<td>' + action + '</td>' +
+          '</tr>';
         }).join('');
       }
 
       function renderWorkers(workers) {
         workersRows.innerHTML = workers.map(w => {
           const metrics = w.heartbeat_metrics || {};
-          return `<tr>
-            <td class="mono">${w.worker_id}</td>
-            <td class="pill ${w.status === 'ONLINE' ? 'ok' : 'bad'}">${w.status}</td>
-            <td class="mono">${w.current_job_id || '-'}</td>
-            <td>${w.heartbeat_age_sec == null ? 'n/a' : formatAge(w.heartbeat_age_sec)}</td>
-            <td class="small mono">${(w.capabilities || []).join(', ') || '-'}</td>
-            <td class="small mono">${metricsText(metrics)}</td>
-          </tr>`;
+          return '<tr>' +
+            '<td class="mono">' + w.worker_id + '</td>' +
+            '<td class="pill ' + (w.status === 'ONLINE' ? 'ok' : 'bad') + '">' + w.status + '</td>' +
+            '<td class="mono">' + (w.current_job_id || '-') + '</td>' +
+            '<td>' + (w.heartbeat_age_sec == null ? 'n/a' : formatAge(w.heartbeat_age_sec)) + '</td>' +
+            '<td class="small mono">' + ((w.capabilities || []).join(', ') || '-') + '</td>' +
+            '<td class="small mono">' + metricsText(metrics) + '</td>' +
+          '</tr>';
         }).join('');
       }
 
       function renderEvents(events) {
         eventsRows.innerHTML = events.map(ev => {
           const details = ev.details ? JSON.stringify(ev.details) : '';
-          return `<tr>
-            <td>${formatEpoch(ev.ts)}</td>
-            <td>${ev.component || ''}</td>
-            <td>${ev.event || ''}</td>
-            <td>${ev.level || ''}</td>
-            <td class="small mono">${ev.job_id ? ev.job_id : ''} ${ev.worker_id ? `/ ${ev.worker_id}` : ''}</td>
-            <td class="small mono">${details}</td>
-          </tr>`;
+          return '<tr>' +
+            '<td>' + formatEpoch(ev.ts) + '</td>' +
+            '<td>' + (ev.component || '') + '</td>' +
+            '<td>' + (ev.event || '') + '</td>' +
+            '<td>' + (ev.level || '') + '</td>' +
+            '<td class="small mono">' + (ev.job_id ? ev.job_id : '') + (ev.worker_id ? ' / ' + ev.worker_id : '') + '</td>' +
+            '<td class="small mono">' + details + '</td>' +
+          '</tr>';
         }).join('');
       }
 
@@ -518,9 +520,9 @@ func dashboardUI() http.HandlerFunc {
           setStatus('set token to query API');
           return;
         }
-        const filters = state().statusFilter ? `?status=${encodeURIComponent(state().statusFilter)}` : '';
+        const filters = state().statusFilter ? '?status=' + encodeURIComponent(state().statusFilter) : '';
         const [jobsResp, workersResp, eventsResp] = await Promise.all([
-          callApi(`/jobs${filters}`),
+          callApi('/jobs' + filters),
           callApi('/workers'),
           callApi('/events?limit=20')
         ]);
@@ -530,26 +532,26 @@ func dashboardUI() http.HandlerFunc {
 
         if (!jobsResp.ok) {
           allOk = false;
-          jobsError.textContent = `jobs: ${jobsResp.status} ${jobsResp.raw || ''}`;
+          jobsError.textContent = 'jobs: ' + jobsResp.status + ' ' + (jobsResp.raw || '');
         } else {
           renderJobs(jobsResp.payload || []);
         }
 
         if (!workersResp.ok) {
           allOk = false;
-          workersError.textContent = `workers: ${workersResp.status} ${workersResp.raw || ''}`;
+          workersError.textContent = 'workers: ' + workersResp.status + ' ' + (workersResp.raw || '');
         } else {
           renderWorkers(workersResp.payload || []);
         }
 
         if (!eventsResp.ok) {
           allOk = false;
-          eventsError.textContent = `events: ${eventsResp.status} ${eventsResp.raw || ''}`;
+          eventsError.textContent = 'events: ' + eventsResp.status + ' ' + (eventsResp.raw || '');
         } else {
           renderEvents(eventsResp.payload || []);
         }
 
-        setStatus(allOk ? `last refresh ${new Date().toLocaleTimeString()}` : 'refresh errors');
+        setStatus(allOk ? 'last refresh ' + new Date().toLocaleTimeString() : 'refresh errors');
       }
 
       function startTicker() {
@@ -557,7 +559,7 @@ func dashboardUI() http.HandlerFunc {
         const interval = Number(refreshMs.value || 3000);
         timer = setInterval(async () => {
           const next = Number(interval) / 1000;
-          nextRefreshEl.textContent = `next in ${next.toFixed(1)}s`;
+          nextRefreshEl.textContent = 'next in ' + next.toFixed(1) + 's';
           await refreshAll();
         }, interval);
       }
@@ -578,7 +580,7 @@ func dashboardUI() http.HandlerFunc {
         jobStatus.addEventListener('change', refreshAll);
         setInterval(() => {
           const next = Number(refreshMs.value || 3000) / 1000;
-          nextRefreshEl.textContent = `next in ${next.toFixed(1)}s`;
+          nextRefreshEl.textContent = 'next in ' + next.toFixed(1) + 's';
         }, 1000);
         startTicker();
         await refreshAll();
@@ -665,9 +667,9 @@ func parseConfig() controlConfig {
 	flag.StringVar(&cfg.addr, "addr", defaultAddr, "control plane listen addr")
 	flag.StringVar(&cfg.dbPath, "db", defaultDBPath, "sqlite db path")
 	flag.StringVar(&legacyToken, "token", defaultToken, "legacy shared token for admin and worker endpoints")
-	flag.StringVar(&cfg.adminToken, "admin-token", "", "admin token (overrides -token)")
+	flag.StringVar(&cfg.adminToken, "admin-token", defaultAdminToken, "admin token (overrides -token)")
 	flag.StringVar(&cfg.adminTokenPrev, "admin-token-prev", defaultAdminTokenPrev, "previous admin token (for rotation)")
-	flag.StringVar(&cfg.workerToken, "worker-token", "", "worker token (overrides -token)")
+	flag.StringVar(&cfg.workerToken, "worker-token", defaultWorkerToken, "worker token (overrides -token)")
 	flag.StringVar(&cfg.workerTokenPrev, "worker-token-prev", defaultWorkerTokenPrev, "previous worker token (for rotation)")
 	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", defaultWorkerTokenSecret, "secret for short-lived signed worker tokens")
 	var workerTokenTTLSeconds int64

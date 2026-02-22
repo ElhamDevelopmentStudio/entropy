@@ -455,7 +455,7 @@ func (s *Store) ensureAuditEventIndexes(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) logEvent(ctx context.Context, tx *sql.Tx, component, level, eventName, workerID, jobID string, details map[string]any) error {
+func (s *Store) logEvent(ctx context.Context, tx *sql.Tx, level, eventName, workerID, jobID string, details map[string]any) error {
 	requestID := requestIDFromContext(ctx)
 	now := time.Now().Unix()
 	if strings.TrimSpace(level) == "" {
@@ -866,8 +866,12 @@ func (s *Store) ListJobs(ctx context.Context, statusFilter, workerIDFilter strin
 	query := `
 		SELECT j.id, j.status, j.command, j.args, j.working_dir, j.timeout_ms, j.priority, j.scheduled_at, j.needs_gpu, j.requirements, j.created_at, j.updated_at,
 		       j.attempt_count, j.max_attempts, j.worker_id, j.assignment_id, j.assignment_expires_at,
-		       j.last_error, j.result_path, j.updated_by,
-		       j.artifact_storage_backend, j.artifact_storage_location, j.artifact_upload_state, j.artifact_upload_error,
+		       COALESCE(j.last_error, ''),
+		       COALESCE(j.result_path, ''),
+		       COALESCE(j.updated_by, ''),
+		       COALESCE(j.artifact_storage_backend, 'local'),
+		       COALESCE(j.artifact_storage_location, ''),
+		       COALESCE(j.artifact_upload_state, ''), COALESCE(j.artifact_upload_error, ''),
 		       w.last_seen
 		FROM jobs j
 		LEFT JOIN workers w ON w.worker_id = j.worker_id
@@ -1099,8 +1103,13 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, e
 	query := `
 		SELECT j.id, j.status, j.command, j.args, j.working_dir, j.timeout_ms, j.priority, j.scheduled_at, j.needs_gpu, j.requirements, j.created_at, j.updated_at,
 		       j.attempt_count, j.max_attempts, j.worker_id, j.assignment_id, j.assignment_expires_at,
-		       j.last_error, j.result_path, j.updated_by,
-		       j.artifact_storage_backend, j.artifact_storage_location, j.artifact_upload_state, j.artifact_upload_error,
+		       COALESCE(j.last_error, ''),
+		       COALESCE(j.result_path, ''),
+		       COALESCE(j.updated_by, ''),
+		       COALESCE(j.artifact_storage_backend, 'local'),
+		       COALESCE(j.artifact_storage_location, ''),
+		       COALESCE(j.artifact_upload_state, ''),
+		       COALESCE(j.artifact_upload_error, ''),
 		       w.last_seen
 		FROM jobs j
 		LEFT JOIN workers w ON w.worker_id = j.worker_id
@@ -1114,8 +1123,8 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, e
 	var assignmentID sql.NullString
 	var assignmentExpires sql.NullInt64
 	var workerLastSeen sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, query, id).Scan(
-		&job.JobID,
+		if err := s.db.QueryRowContext(ctx, query, id).Scan(
+			&job.JobID,
 		&job.Status,
 		&job.Command,
 		&argsJSON,
@@ -1140,12 +1149,12 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, e
 		&job.ArtifactUploadState,
 		&job.ArtifactUploadError,
 		&workerLastSeen,
-	); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return hdcf.JobRead{}, false, nil
+		); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return hdcf.JobRead{}, false, nil
+			}
+			return hdcf.JobRead{}, false, err
 		}
-		return hdcf.JobRead{}, false, err
-	}
 	if strings.TrimSpace(job.ArtifactStorageBackend) == "" {
 		job.ArtifactStorageBackend = hdcf.ArtifactStorageBackendLocal
 	}
@@ -1459,7 +1468,7 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 		orderBy = "ORDER BY (j.priority + ((? - j.created_at) / " + strconv.FormatInt(s.queueAgingWindowSeconds, 10) + ")) DESC, j.priority DESC, j.created_at ASC, j.id ASC"
 	}
 	query := `SELECT id, command, args, working_dir, timeout_ms, attempt_count, max_attempts, needs_gpu, requirements
-		FROM jobs
+		FROM jobs j
 		WHERE status = ?
 		  AND attempt_count < max_attempts
 		  AND scheduled_at <= ?
@@ -1469,7 +1478,7 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 			OR worker_id = ''
 			OR NOT EXISTS (
 				SELECT 1 FROM workers w
-				WHERE w.worker_id = jobs.worker_id
+				WHERE w.worker_id = j.worker_id
 					AND w.status = 'ONLINE'
 		      AND w.last_seen >= ?
 			)
@@ -1749,16 +1758,16 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 						"worker_id": req.WorkerID,
 					})
 				} else {
-					if _, err := tx.ExecContext(
-						ctx,
-						`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, updated_by = 'reconnect', updated_at = ? WHERE id = ? AND status = ?`,
-						hdcf.StatusLost,
-						now,
-						currentJobID,
-						hdcf.StatusRunning,
-					); err != nil {
-						return nil, err
-					}
+						if _, err := tx.ExecContext(
+							ctx,
+							`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, updated_by = 'reconnect', updated_at = ? WHERE id = ? AND status = ?`,
+							hdcf.StatusLost,
+							now,
+							currentJobID,
+							hdcf.StatusRunning,
+						); err != nil {
+							return nil, err
+						}
 					_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
 						"action":   "reassign_to_lost",
 						"from_status": hdcf.StatusRunning,
@@ -1788,16 +1797,16 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 						"worker_id": req.WorkerID,
 					})
 				} else {
-					if _, err := tx.ExecContext(
-						ctx,
-						`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, updated_by = 'reconnect', updated_at = ? WHERE id = ? AND status = ?`,
-						hdcf.StatusPending,
-						now,
-						currentJobID,
-						hdcf.StatusAssigned,
-					); err != nil {
-						return nil, err
-					}
+						if _, err := tx.ExecContext(
+							ctx,
+							`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, updated_by = 'reconnect', updated_at = ? WHERE id = ? AND status = ?`,
+							hdcf.StatusPending,
+							now,
+							currentJobID,
+							hdcf.StatusAssigned,
+						); err != nil {
+							return nil, err
+						}
 					_ = s.logEvent(ctx, tx, "info", "worker.reconnect_current_job", req.WorkerID, currentJobID, map[string]any{
 						"action":    "reassign_to_pending",
 						"from_status": hdcf.StatusAssigned,
@@ -2435,11 +2444,12 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(
+		res, err := tx.ExecContext(
 		ctx,
 		`UPDATE workers SET status = 'OFFLINE' WHERE status = 'ONLINE' AND last_seen < ?`,
 		cutoff,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	offlineWorkers, err := res.RowsAffected()
@@ -2470,7 +2480,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		     )
 		   )`,
 		now,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	lostFromRunningOffline, err := res.RowsAffected()
@@ -2498,7 +2509,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		 WHERE status = 'RUNNING'
 		   AND worker_id NOT IN (SELECT worker_id FROM workers)`,
 		now,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	lostFromRunningMissing, err := res.RowsAffected()
@@ -2530,7 +2542,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		     OR worker_id NOT IN (SELECT worker_id FROM workers)
 		   )`,
 		now,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	pendingFromAssignedMissing, err := res.RowsAffected()
@@ -2556,7 +2569,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		   AND updated_at < ?`,
 		now,
 		lostRetryCutoff,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	lostToRetrying, err := res.RowsAffected()
@@ -2586,7 +2600,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		   AND assignment_expires_at < ?`,
 		now,
 		cutoff,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	assignedExpiredToPending, err := res.RowsAffected()
@@ -2617,7 +2632,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		   AND updated_at < ?`,
 		now,
 		lostRetryCutoff,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	retryingToPending, err := res.RowsAffected()
@@ -2648,7 +2664,8 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		   AND updated_at < ?`,
 		now,
 		lostRetryCutoff,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 	retryingToFailed, err := res.RowsAffected()

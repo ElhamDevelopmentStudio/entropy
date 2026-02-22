@@ -62,7 +62,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("artifact storage backend: %v", err)
 	}
-	runner.artifactUploader = artifactUploader
+	runner.artifactStorage = artifactUploader
 	runner.artifactStorageBackend = hdcf.NormalizeArtifactStorageBackend(cfg.artifactStorageBackend)
 	runner.artifactStorageLocation = strings.TrimSpace(cfg.artifactStorageLocation)
 	if runner.logDir == "" {
@@ -974,7 +974,7 @@ func (r *workerRunner) validateWorkingDir(raw string) error {
 }
 
 func (r *workerRunner) register(ctx context.Context) error {
-	req := hdcf.WorkerRegisterRequest{
+	req := hdcf.RegisterWorkerRequest{
 		WorkerID:     r.workerID,
 		Nonce:        r.nonce,
 		Capabilities: r.capabilities,
@@ -1919,9 +1919,7 @@ func (r *workerRunner) cleanupLogArtifacts() error {
 	}
 	currentJob := ""
 	if v := r.getCurrentJobID(); v != nil {
-		if val, ok := v.(string); ok {
-			currentJob = strings.TrimSpace(val)
-		}
+		currentJob = strings.TrimSpace(*v)
 	}
 
 	var deleted, failed int64
