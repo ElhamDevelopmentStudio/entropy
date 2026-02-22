@@ -129,9 +129,12 @@ type CompleteRequest struct {
 	JobID         string `json:"job_id"`
 	WorkerID      string `json:"worker_id"`
 	AssignmentID  string `json:"assignment_id"`
+	ArtifactID    string `json:"artifact_id"`
 	ExitCode      int    `json:"exit_code"`
 	StdoutPath    string `json:"stdout_path"`
 	StderrPath    string `json:"stderr_path"`
+	StdoutTmpPath string `json:"stdout_tmp_path"`
+	StderrTmpPath string `json:"stderr_tmp_path"`
 	ResultSummary string `json:"result_summary"`
 }
 
@@ -146,10 +149,13 @@ type FailRequest struct {
 type ReconnectCompletedJob struct {
 	JobID         string `json:"job_id"`
 	AssignmentID  string `json:"assignment_id"`
+	ArtifactID    string `json:"artifact_id"`
 	Status        string `json:"status"`
 	ExitCode      int    `json:"exit_code"`
 	StdoutPath    string `json:"stdout_path"`
 	StderrPath    string `json:"stderr_path"`
+	StdoutTmpPath string `json:"stdout_tmp_path"`
+	StderrTmpPath string `json:"stderr_tmp_path"`
 	ResultSummary string `json:"result_summary"`
 	Error         string `json:"error"`
 }

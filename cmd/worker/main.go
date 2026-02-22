@@ -381,17 +381,19 @@ func (r *workerRunner) postJSONWithResponse(ctx context.Context, endpoint string
 
 func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 	start := time.Now()
+	stdoutTmpPath := filepath.Join(r.logDir, fmt.Sprintf("%s.stdout.log.tmp", job.JobID))
+	stderrTmpPath := filepath.Join(r.logDir, fmt.Sprintf("%s.stderr.log.tmp", job.JobID))
 	stdoutPath := filepath.Join(r.logDir, fmt.Sprintf("%s.stdout.log", job.JobID))
 	stderrPath := filepath.Join(r.logDir, fmt.Sprintf("%s.stderr.log", job.JobID))
 
-	stdout, err := os.Create(stdoutPath)
+	stdout, err := os.Create(stdoutTmpPath)
 	if err != nil {
 		r.handleJobFailure(ctx, job, err)
 		return
 	}
 	defer stdout.Close()
 
-	stderr, err := os.Create(stderrPath)
+	stderr, err := os.Create(stderrTmpPath)
 	if err != nil {
 		r.handleJobFailure(ctx, job, err)
 		return
@@ -441,7 +443,8 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			AssignmentID:  job.AssignmentID,
 			Status:       hdcf.StatusFailed,
 			ExitCode:     failReq.ExitCode,
-			StderrPath:   stderrPath,
+			StderrPath:   stderrTmpPath,
+			StdoutPath:   stdoutTmpPath,
 			Error:        msg,
 		}
 		if err := r.enqueueCompletedReconnectResult(reconnectEntry); err != nil {
@@ -458,15 +461,31 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		return
 	}
 
+	if err := r.finalizeArtifact(stdoutTmpPath, stdoutPath); err != nil {
+		failMsg := fmt.Sprintf("artifact finalization failed: %v", err)
+		r.handleJobFailure(ctx, job, errors.New(failMsg))
+		return
+	}
+	if err := r.finalizeArtifact(stderrTmpPath, stderrPath); err != nil {
+		_ = os.Rename(stdoutPath, stdoutTmpPath)
+		failMsg := fmt.Sprintf("artifact finalization failed: %v", err)
+		r.handleJobFailure(ctx, job, errors.New(failMsg))
+		return
+	}
+
 	duration := time.Since(start).Milliseconds()
 	summary := fmt.Sprintf("exit_code=0 duration_ms=%d", duration)
+	artifactID := hdcf.NewJobID()
 	compReq := hdcf.CompleteRequest{
 		JobID:        job.JobID,
 		WorkerID:     r.workerID,
 		AssignmentID: job.AssignmentID,
 		ExitCode:     exitCode,
+		ArtifactID:   artifactID,
 		StdoutPath:   stdoutPath,
 		StderrPath:   stderrPath,
+		StdoutTmpPath: stdoutTmpPath,
+		StderrTmpPath: stderrTmpPath,
 		ResultSummary: summary,
 	}
 	reconnectEntry := hdcf.ReconnectCompletedJob{
@@ -476,6 +495,9 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 		ExitCode:      exitCode,
 		StdoutPath:    stdoutPath,
 		StderrPath:    stderrPath,
+		ArtifactID:    artifactID,
+		StdoutTmpPath: stdoutTmpPath,
+		StderrTmpPath: stderrTmpPath,
 		ResultSummary: summary,
 	}
 	if err := r.enqueueCompletedReconnectResult(reconnectEntry); err != nil {
@@ -489,6 +511,14 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			log.Printf("clear completion for job %s: %v", job.JobID, err)
 		}
 	}
+}
+
+func (r *workerRunner) finalizeArtifact(tmpPath, finalPath string) error {
+	_, err := os.Stat(tmpPath)
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, finalPath)
 }
 
 func (r *workerRunner) loadReconnectState() (workerReconnectState, error) {

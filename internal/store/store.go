@@ -63,6 +63,11 @@ func (s *Store) initSchema(ctx context.Context) error {
 		assignment_expires_at INTEGER,
 		last_error TEXT,
 		result_path TEXT,
+		artifact_id TEXT,
+		artifact_stdout_tmp_path TEXT,
+		artifact_stdout_path TEXT,
+		artifact_stderr_tmp_path TEXT,
+		artifact_stderr_path TEXT,
 		updated_by TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at);
@@ -110,6 +115,11 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 	need := []columnDef{
 		{name: "assignment_id", ddl: "ALTER TABLE jobs ADD COLUMN assignment_id TEXT"},
 		{name: "assignment_expires_at", ddl: "ALTER TABLE jobs ADD COLUMN assignment_expires_at INTEGER"},
+		{name: "artifact_id", ddl: "ALTER TABLE jobs ADD COLUMN artifact_id TEXT"},
+		{name: "artifact_stdout_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_tmp_path TEXT"},
+		{name: "artifact_stdout_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_path TEXT"},
+		{name: "artifact_stderr_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_tmp_path TEXT"},
+		{name: "artifact_stderr_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_path TEXT"},
 	}
 	for _, col := range need {
 		if _, ok := columns[col.name]; ok {
@@ -480,8 +490,11 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 				WorkerID:     req.WorkerID,
 				AssignmentID: assignmentID,
 				ExitCode:     completed.ExitCode,
+				ArtifactID:   completed.ArtifactID,
 				StdoutPath:   completed.StdoutPath,
 				StderrPath:   completed.StderrPath,
+				StdoutTmpPath: completed.StdoutTmpPath,
+				StderrTmpPath: completed.StderrTmpPath,
 				ResultSummary: completed.ResultSummary,
 			})
 			if err != nil {
@@ -548,9 +561,9 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	}
 	defer tx.Rollback()
 
-	var status, workerID, assignmentID, lastError, resultPath sql.NullString
-	errScan := tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id, last_error, result_path FROM jobs WHERE id = ?`, req.JobID).
-		Scan(&status, &workerID, &assignmentID, &lastError, &resultPath)
+	var status, workerID, assignmentID sql.NullString
+	errScan := tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id FROM jobs WHERE id = ?`, req.JobID).
+		Scan(&status, &workerID, &assignmentID)
 	if errScan != nil {
 		if errors.Is(errScan, sql.ErrNoRows) {
 			return fmt.Errorf("job not found")
@@ -569,6 +582,27 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	if !hdcf.IsValidTransition(status.String, hdcf.StatusCompleted) {
 		return fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusCompleted)
 	}
+	if strings.TrimSpace(req.ArtifactID) == "" {
+		return fmt.Errorf("artifact_id required")
+	}
+	if strings.TrimSpace(req.StdoutPath) == "" {
+		return fmt.Errorf("stdout_path required")
+	}
+	if strings.TrimSpace(req.StderrPath) == "" {
+		return fmt.Errorf("stderr_path required")
+	}
+	if strings.TrimSpace(req.StdoutTmpPath) == "" {
+		return fmt.Errorf("stdout_tmp_path required")
+	}
+	if strings.TrimSpace(req.StderrTmpPath) == "" {
+		return fmt.Errorf("stderr_tmp_path required")
+	}
+	if err := validateCompletedArtifact(req.StdoutPath, req.StdoutTmpPath, "stdout"); err != nil {
+		return err
+	}
+	if err := validateCompletedArtifact(req.StderrPath, req.StderrTmpPath, "stderr"); err != nil {
+		return err
+	}
 	if workerID.Valid && workerID.String != req.WorkerID {
 		return fmt.Errorf("job worker mismatch for completion")
 	}
@@ -584,9 +618,15 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 
 	_, err = tx.ExecContext(
 		ctx,
-		`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL, result_path = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+		`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
+		 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
 		hdcf.StatusCompleted,
 		req.StdoutPath,
+		req.ArtifactID,
+		req.StdoutTmpPath,
+		req.StdoutPath,
+		req.StderrTmpPath,
+		req.StderrPath,
 		req.ResultSummary,
 		time.Now().Unix(),
 		req.WorkerID,
@@ -596,6 +636,25 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 		return err
 	}
 	return tx.Commit()
+}
+
+func validateCompletedArtifact(finalPath, tmpPath, label string) error {
+	if strings.TrimSpace(finalPath) == "" {
+		return fmt.Errorf("%s_path required", label)
+	}
+	if strings.TrimSpace(tmpPath) == "" {
+		return fmt.Errorf("%s_tmp_path required", label)
+	}
+	if strings.TrimSpace(finalPath) == strings.TrimSpace(tmpPath) {
+		return fmt.Errorf("%s tmp path must differ from final path", label)
+	}
+	if strings.HasSuffix(finalPath, ".tmp") {
+		return fmt.Errorf("%s final path should not be a temp path: %s", label, finalPath)
+	}
+	if !strings.HasSuffix(tmpPath, ".tmp") {
+		return fmt.Errorf("%s temp path should be a temp file path: %s", label, tmpPath)
+	}
+	return nil
 }
 
 func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {

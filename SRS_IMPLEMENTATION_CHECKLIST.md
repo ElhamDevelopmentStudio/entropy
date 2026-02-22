@@ -31,9 +31,6 @@ Basic CLI enqueue helper
 Static token auth via `X-API-Token`
 
 Not yet implemented from SRS:
-Duplicate completion safety and reconciliation protocol
-Worker registration/reconnect semantics
-Artifact integrity + atomic completion guarantee
 Control-plane restart reconciliation hardening
 
 ## How to read this checklist
@@ -114,12 +111,17 @@ Worker restart after crash leads to deterministic recovery path.
 In-flight jobs re-enter valid state without manual intervention.
 Dependency: P1-03.
 
-6. `[ ]` P1-06 — Implement artifact-safe completion contract
+6. `[x]` P1-06 — Implement artifact-safe completion contract
 Requirement source: `SRS.md` Section 4.5
 Target: `cmd/worker/main.go`, `cmd/control/main.go`, `internal/store/store.go`, `internal/hdcf/types.go`
 Implementation details:
 Worker writes outputs as temp files and atomically renames only on success.
 Control plane stores artifact metadata and validates temp rename completion.
+Progress:
+- Implemented temp-output write path in worker execution.
+- Completion requests now include artifact metadata (`artifact_id`, artifact tmp/final paths).
+- Control plane validates artifact contract fields (required paths and temp/final separation) before marking jobs complete.
+- Duplicate reconnection replay now propagates artifact metadata.
 Reject completion if output is missing or incomplete.
 Acceptance criteria:
 Partial artifacts are never marked `COMPLETED`.
