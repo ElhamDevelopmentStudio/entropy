@@ -38,13 +38,15 @@ func main() {
 	go runReconciler(ctx, s, cfg.reconcileInterval)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/jobs", withAuth(cfg.apiToken, createJob(s)))
+	mux.HandleFunc("/jobs", withAuth(cfg.apiToken, jobsHandler(s)))
+	mux.HandleFunc("/jobs/", withAuth(cfg.apiToken, getJobHandler(s)))
 	mux.HandleFunc("/register", withAuth(cfg.apiToken, registerWorker(s)))
 	mux.HandleFunc("/next-job", withAuth(cfg.apiToken, nextJob(s)))
 	mux.HandleFunc("/ack", withAuth(cfg.apiToken, ackJob(s)))
 	mux.HandleFunc("/heartbeat", withAuth(cfg.apiToken, heartbeat(s)))
 	mux.HandleFunc("/reconnect", withAuth(cfg.apiToken, reconnectWorker(s)))
 	mux.HandleFunc("/abort", withAuth(cfg.apiToken, abortJob(s)))
+	mux.HandleFunc("/workers", withAuth(cfg.apiToken, listWorkers(s)))
 	mux.HandleFunc("/complete", withAuth(cfg.apiToken, completeJob(s)))
 	mux.HandleFunc("/fail", withAuth(cfg.apiToken, failJob(s)))
 
@@ -122,6 +124,66 @@ func createJob(s *store.Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusCreated, res)
+	}
+}
+
+func jobsHandler(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			status := strings.TrimSpace(r.URL.Query().Get("status"))
+			workerID := strings.TrimSpace(r.URL.Query().Get("worker_id"))
+			jobs, err := s.ListJobs(r.Context(), status, workerID)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, jobs)
+		case http.MethodPost:
+			createJob(s)(w, r)
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	}
+}
+
+func getJobHandler(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		jobID := strings.TrimPrefix(r.URL.Path, "/jobs/")
+		jobID = strings.TrimSpace(jobID)
+		if jobID == "" || strings.Contains(jobID, "/") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid job_id"})
+			return
+		}
+		job, ok, err := s.GetJob(r.Context(), jobID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, job)
+	}
+}
+
+func listWorkers(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		workers, err := s.ListWorkers(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, workers)
 	}
 }
 
