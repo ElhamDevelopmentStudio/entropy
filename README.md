@@ -159,7 +159,9 @@ Entropy is particularly suited for:
 
 # Architecture Overview
 
-![Entropy distributed architecture](assets/architecture-diagram.png)
+![Entropy distributed architecture](assets/entropy-architecture-overview.png)
+
+![Lease and recovery lifecycle](assets/entropy-recovery-transitions.png)
 
 See:
 - [ARCHITECTURE.md](ARCHITECTURE.md)
