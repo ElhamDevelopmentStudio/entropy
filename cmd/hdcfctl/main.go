@@ -40,7 +40,7 @@ func main() {
 
 func usage() {
 	fmt.Println("hdcfctl <command>")
-	fmt.Println("  submit --command <command> [--arg A --arg B] [--url=http://localhost:8080] [--token=dev-token]")
+	fmt.Println("  submit --command <command> [--args=\"A,B\"] [--url=http://localhost:8080] [--token=dev-token]")
 	fmt.Println("  jobs list [--status=STATUS] [--worker-id=<id>] [--url=http://localhost:8080] [--token=dev-token]")
 	fmt.Println("  jobs describe <job_id> [--url=http://localhost:8080] [--token=dev-token]")
 	fmt.Println("  workers list [--url=http://localhost:8080] [--token=dev-token]")

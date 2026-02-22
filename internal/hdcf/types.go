@@ -23,6 +23,16 @@ const (
 	ReconnectActionReplayFailed    = "REPLAY_FAILED"
 	ReconnectResultAccepted       = "ACCEPTED"
 	ReconnectResultRejected       = "REJECTED"
+
+	ArtifactStorageBackendLocal = "local"
+	ArtifactStorageBackendNFS   = "nfs"
+	ArtifactStorageBackendS3    = "s3"
+
+	ArtifactUploadStateOK       = "ok"
+	ArtifactUploadStatePending  = "pending"
+	ArtifactUploadStateFailed   = "failed"
+	ArtifactUploadStateSkipped  = "skipped"
+	ArtifactUploadStateNoop     = "noop"
 )
 
 var validTransitions = map[string]map[string]bool{
@@ -125,6 +135,10 @@ type JobRead struct {
 	LastError          string   `json:"last_error"`
 	ResultPath         string   `json:"result_path"`
 	UpdatedBy          string   `json:"updated_by"`
+	ArtifactStorageBackend  string `json:"artifact_storage_backend"`
+	ArtifactLocation        string `json:"artifact_location"`
+	ArtifactUploadState     string `json:"artifact_upload_state"`
+	ArtifactUploadError     string `json:"artifact_upload_error"`
 	HeartbeatAgeSec    *int64   `json:"heartbeat_age_sec,omitempty"`
 }
 
@@ -194,6 +208,10 @@ type CompleteRequest struct {
 	StderrSHA256  string `json:"stderr_sha256"`
 	ResultSummary string `json:"result_summary"`
 	CompletionSeq int64  `json:"completion_seq"`
+	ArtifactBackend string `json:"artifact_backend"`
+	ArtifactLocation string `json:"artifact_location"`
+	ArtifactUploadState string `json:"artifact_upload_state"`
+	ArtifactUploadError string `json:"artifact_upload_error"`
 }
 
 type FailRequest struct {
@@ -223,6 +241,10 @@ type ReconnectCompletedJob struct {
 	StderrTmpPath string `json:"stderr_tmp_path"`
 	StdoutSHA256  string `json:"stdout_sha256"`
 	StderrSHA256  string `json:"stderr_sha256"`
+	ArtifactBackend string `json:"artifact_backend"`
+	ArtifactLocation string `json:"artifact_location"`
+	ArtifactUploadState string `json:"artifact_upload_state"`
+	ArtifactUploadError string `json:"artifact_upload_error"`
 	ResultSummary string `json:"result_summary"`
 	Error         string `json:"error"`
 }
@@ -264,6 +286,43 @@ func IsValidStatus(status string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func NormalizeArtifactStorageBackend(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return ArtifactStorageBackendLocal
+	}
+	switch raw {
+	case "nfs-share", "nfs_share":
+		return ArtifactStorageBackendNFS
+	case "s3", "s3-compatible", "s3_compatible":
+		return ArtifactStorageBackendS3
+	case ArtifactStorageBackendLocal, ArtifactStorageBackendNFS, ArtifactStorageBackendS3:
+		return raw
+	default:
+		return raw
+	}
+}
+
+func IsValidArtifactStorageBackend(raw string) bool {
+	switch NormalizeArtifactStorageBackend(raw) {
+	case ArtifactStorageBackendLocal, ArtifactStorageBackendNFS, ArtifactStorageBackendS3:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeArtifactUploadState(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return ArtifactUploadStatePending
+	case ArtifactUploadStateFailed, ArtifactUploadStateOK, ArtifactUploadStateSkipped, ArtifactUploadStateNoop:
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
 	}
 }
 

@@ -58,6 +58,13 @@ func main() {
 		dryRun:                cfg.dryRun,
 		allowedWorkingDirs:    cfg.allowedWorkingDirs,
 	}
+	artifactUploader, err := newArtifactUploader(cfg.artifactStorageBackend, cfg.artifactStorageLocation)
+	if err != nil {
+		log.Fatalf("artifact storage backend: %v", err)
+	}
+	runner.artifactUploader = artifactUploader
+	runner.artifactStorageBackend = hdcf.NormalizeArtifactStorageBackend(cfg.artifactStorageBackend)
+	runner.artifactStorageLocation = strings.TrimSpace(cfg.artifactStorageLocation)
 	if runner.logDir == "" {
 		runner.logDir = "worker-logs"
 	}
@@ -129,6 +136,8 @@ type workerConfig struct {
 	requireNonRoot         bool
 	dryRun                bool
 	allowedWorkingDirs    []string
+	artifactStorageBackend string
+	artifactStorageLocation string
 	tlsCA            string
 	tlsClientCert    string
 	tlsClientKey     string
@@ -154,6 +163,8 @@ func parseWorkerConfig() workerConfig {
 	var logCleanupIntervalSec int
 	allowedCommands := flag.String("allowed-commands", getenv("HDCF_WORKER_ALLOWED_COMMANDS", ""), "comma-separated allowed command binaries when -command-allowlist is enabled")
 	allowedWorkingDirs := flag.String("allowed-working-dirs", getenv("HDCF_WORKER_ALLOWED_WORKING_DIRS", ""), "comma-separated allowed working directories for strict job execution checks")
+	artifactStorageBackend := flag.String("artifact-storage-backend", getenv("HDCF_ARTIFACT_STORAGE_BACKEND", hdcf.ArtifactStorageBackendLocal), "artifact storage backend: local|nfs|s3")
+	artifactStorageLocation := flag.String("artifact-storage-location", getenv("HDCF_ARTIFACT_STORAGE_LOCATION", ""), "storage location for non-local artifact backends")
 	commandAllowlist := flag.Bool("command-allowlist", getenvBool("HDCF_WORKER_COMMAND_ALLOWLIST", false), "enforce command allowlist before execution")
 	requireNonRoot := flag.Bool("require-non-root", getenvBool("HDCF_WORKER_REQUIRE_NON_ROOT", false), "reject running jobs when this process is running as root")
 	dryRun := flag.Bool("dry-run", getenvBool("HDCF_WORKER_DRY_RUN", false), "validate and simulate execution without running commands")
@@ -191,6 +202,17 @@ func parseWorkerConfig() workerConfig {
 	cfg.requestTimeout = time.Duration(timeoutSec) * time.Second
 	cfg.logRetentionDays = logRetentionDays
 	cfg.logCleanupInterval = time.Duration(logCleanupIntervalSec) * time.Second
+	cfg.artifactStorageBackend = hdcf.NormalizeArtifactStorageBackend(*artifactStorageBackend)
+	cfg.artifactStorageLocation = strings.TrimSpace(*artifactStorageLocation)
+	if !hdcf.IsValidArtifactStorageBackend(cfg.artifactStorageBackend) {
+		log.Fatalf("unsupported artifact storage backend: %s", cfg.artifactStorageBackend)
+	}
+	if cfg.artifactStorageBackend == hdcf.ArtifactStorageBackendS3 {
+		log.Fatalf("artifact storage backend %s is not yet supported", hdcf.ArtifactStorageBackendS3)
+	}
+	if cfg.artifactStorageBackend == hdcf.ArtifactStorageBackendNFS && strings.TrimSpace(cfg.artifactStorageLocation) == "" {
+		log.Fatalf("artifact-storage-location is required for nfs backend")
+	}
 	if strings.TrimSpace(cfg.workerID) == "" {
 		host, _ := os.Hostname()
 		cfg.workerID = fmt.Sprintf("%s-%s", host, hdcf.NewJobID())
@@ -349,6 +371,9 @@ type workerRunner struct {
 	requireNonRoot         bool
 	dryRun                bool
 	allowedWorkingDirs    []string
+	artifactStorageBackend  string
+	artifactStorageLocation string
+	artifactStorage       artifactUploader
 }
 
 type workerReconnectState struct {
@@ -357,6 +382,137 @@ type workerReconnectState struct {
 	CompletedJobs     []hdcf.ReconnectCompletedJob `json:"completed_jobs"`
 	HeartbeatSeq      int64                      `json:"heartbeat_seq"`
 	LastCompletionSeq int64                      `json:"last_completion_seq"`
+}
+
+type artifactUploadState struct {
+	backend string
+	location string
+	state string
+	errorMsg string
+}
+
+type artifactUploader interface {
+	UploadArtifacts(ctx context.Context, jobID string, artifactID string, stdoutPath, stderrPath string) (artifactUploadState, error)
+}
+
+type localArtifactUploader struct{}
+
+type nfsArtifactUploader struct {
+	rootPath string
+}
+
+func newArtifactUploader(backend, location string) (artifactUploader, error) {
+	switch strings.ToLower(strings.TrimSpace(backend)) {
+	case hdcf.ArtifactStorageBackendNFS:
+		cleanLocation := strings.TrimSpace(location)
+		if cleanLocation == "" {
+			return nil, fmt.Errorf("artifact-storage-location is required for nfs")
+		}
+		return nfsArtifactUploader{rootPath: cleanLocation}, nil
+	case hdcf.ArtifactStorageBackendLocal:
+		return localArtifactUploader{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported artifact backend: %s", backend)
+	}
+}
+
+func (localArtifactUploader) UploadArtifacts(ctx context.Context, jobID, artifactID, stdoutPath, stderrPath string) (artifactUploadState, error) {
+	if strings.TrimSpace(stdoutPath) == "" || strings.TrimSpace(stderrPath) == "" {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendLocal,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: "missing artifact paths",
+		}, fmt.Errorf("artifact path required")
+	}
+	return artifactUploadState{
+		backend:  hdcf.ArtifactStorageBackendLocal,
+		location: filepath.Dir(stdoutPath),
+		state:    hdcf.ArtifactUploadStateOK,
+	}, nil
+}
+
+func (n nfsArtifactUploader) UploadArtifacts(ctx context.Context, jobID, artifactID, stdoutPath, stderrPath string) (artifactUploadState, error) {
+	_ = ctx
+	if strings.TrimSpace(jobID) == "" {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendNFS,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: "missing job id",
+		}, fmt.Errorf("job id required")
+	}
+	if strings.TrimSpace(stdoutPath) == "" || strings.TrimSpace(stderrPath) == "" {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendNFS,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: "missing artifact paths",
+		}, fmt.Errorf("artifact path required")
+	}
+	targetDir := filepath.Clean(n.rootPath)
+	if targetDir == "" {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendNFS,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: "invalid artifact location",
+		}, fmt.Errorf("invalid artifact location")
+	}
+	jobDir := filepath.Join(targetDir, jobID)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendNFS,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: err.Error(),
+		}, err
+	}
+	stdoutDest := filepath.Join(jobDir, filepath.Base(stdoutPath))
+	stderrDest := filepath.Join(jobDir, filepath.Base(stderrPath))
+	if err := copyArtifactFile(stdoutPath, stdoutDest); err != nil {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendNFS,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: err.Error(),
+		}, err
+	}
+	if err := copyArtifactFile(stderrPath, stderrDest); err != nil {
+		return artifactUploadState{
+			backend:  hdcf.ArtifactStorageBackendNFS,
+			state:    hdcf.ArtifactUploadStateFailed,
+			errorMsg: err.Error(),
+		}, err
+	}
+	return artifactUploadState{
+		backend:  hdcf.ArtifactStorageBackendNFS,
+		location: jobDir,
+		state:    hdcf.ArtifactUploadStateOK,
+	}, nil
+}
+
+func copyArtifactFile(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	dstTmp := dst + ".tmp"
+	target, err := os.Create(dstTmp)
+	if err != nil {
+		return err
+	}
+	defer target.Close()
+
+	if _, err := io.Copy(target, source); err != nil {
+		_ = os.Remove(dstTmp)
+		return err
+	}
+	if err := target.Sync(); err != nil {
+		_ = os.Remove(dstTmp)
+		return err
+	}
+	if err := target.Close(); err != nil {
+		_ = os.Remove(dstTmp)
+		return err
+	}
+	return os.Rename(dstTmp, dst)
 }
 
 func (r *workerRunner) loop(ctx context.Context) {
@@ -1272,6 +1428,12 @@ func (r *workerRunner) hashArtifact(path string) (string, error) {
 func (r *workerRunner) reportCompletedJob(ctx context.Context, job *hdcf.AssignedJob, start time.Time, summary, stdoutPath, stderrPath, stdoutTmpPath, stderrTmpPath, stdoutSHA256, stderrSHA256 string, exitCode int) {
 	duration := time.Since(start).Milliseconds()
 	artifactID := hdcf.NewJobID()
+	uploadState, uploadErr := r.artifactStorage.UploadArtifacts(ctx, job.JobID, artifactID, stdoutPath, stderrPath)
+	if uploadErr != nil {
+		failMsg := fmt.Sprintf("artifact storage failed: %v", uploadErr)
+		r.handleJobFailure(ctx, job, errors.New(failMsg))
+		return
+	}
 	completionSeq := r.nextCompletionSeq()
 	compReq := hdcf.CompleteRequest{
 		JobID:         job.JobID,
@@ -1285,6 +1447,10 @@ func (r *workerRunner) reportCompletedJob(ctx context.Context, job *hdcf.Assigne
 		StderrTmpPath: stderrTmpPath,
 		StdoutSHA256:  stdoutSHA256,
 		StderrSHA256:  stderrSHA256,
+		ArtifactBackend: uploadState.backend,
+		ArtifactLocation: uploadState.location,
+		ArtifactUploadState: uploadState.state,
+		ArtifactUploadError: uploadState.errorMsg,
 		CompletionSeq:  completionSeq,
 		ResultSummary:  summary,
 	}
@@ -1301,6 +1467,10 @@ func (r *workerRunner) reportCompletedJob(ctx context.Context, job *hdcf.Assigne
 		StderrTmpPath: stderrTmpPath,
 		StdoutSHA256:  stdoutSHA256,
 		StderrSHA256:  stderrSHA256,
+		ArtifactBackend: uploadState.backend,
+		ArtifactLocation: uploadState.location,
+		ArtifactUploadState: uploadState.state,
+		ArtifactUploadError: uploadState.errorMsg,
 		ResultSummary:  summary,
 	}
 	workerEvent("info", "worker.job_execute", map[string]any{

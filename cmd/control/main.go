@@ -32,18 +32,27 @@ func main() {
 	cfg := parseConfig()
 	ctx := context.Background()
 
-	s, err := store.Open(cfg.dbPath, cfg.heartbeatTimeout)
+	s, err := store.Open(cfg.dbPath, cfg.heartbeatTimeout, store.StoreOptions{
+		QueueAgingWindowSeconds:           cfg.queueAgingWindowSeconds,
+		MaxConcurrentRetriesPerWorker:     cfg.maxConcurrentRetriesPerWorker,
+		PreemptBacklogThreshold:           cfg.preemptBacklogThreshold,
+		PreemptHighPriorityMinimumPriority: cfg.preemptHighPriorityMinimumPriority,
+	})
 	if err != nil {
 		log.Fatalf("failed to open store: %v", err)
 	}
 	defer s.Close()
 
 	auditEvent("info", "control.startup", "", map[string]any{
-		"addr":              cfg.addr,
-		"db_path":           cfg.dbPath,
-		"heartbeat_timeout":  int(cfg.heartbeatTimeout.Seconds()),
-		"reconcile_interval": int(cfg.reconcileInterval.Seconds()),
-		"cleanup_interval":   int(cfg.cleanupInterval.Seconds()),
+		"addr":                         cfg.addr,
+		"db_path":                      cfg.dbPath,
+		"heartbeat_timeout":             int(cfg.heartbeatTimeout.Seconds()),
+		"reconcile_interval":           int(cfg.reconcileInterval.Seconds()),
+		"cleanup_interval":             int(cfg.cleanupInterval.Seconds()),
+		"queue_aging_window_seconds":   cfg.queueAgingWindowSeconds,
+		"max_retry_per_worker":         cfg.maxConcurrentRetriesPerWorker,
+		"preempt_backlog_threshold":    cfg.preemptBacklogThreshold,
+		"preempt_priority_floor":       cfg.preemptHighPriorityMinimumPriority,
 		"jobs_retention_completed_days": cfg.jobsRetentionCompletedDays,
 		"artifacts_retention_days":      cfg.artifactsRetentionDays,
 		"events_retention_days":          cfg.eventsRetentionDays,
@@ -578,21 +587,25 @@ func dashboardUI() http.HandlerFunc {
 </html>`
 
 type controlConfig struct {
-	addr               string
-	dbPath             string
-	adminToken         string
-	adminTokenPrev     string
-	workerToken        string
-	workerTokenPrev    string
-	workerTokenSecret  string
-	workerTokenTTL     time.Duration
-	tlsCert            string
-	tlsKey             string
-	tlsClientCA        string
-	tlsRequireClientCert bool
-	heartbeatTimeout   time.Duration
-	reconcileInterval  time.Duration
-	cleanupInterval    time.Duration
+	addr                           string
+	dbPath                         string
+	adminToken                     string
+	adminTokenPrev                 string
+	workerToken                    string
+	workerTokenPrev                string
+	workerTokenSecret              string
+	workerTokenTTL                 time.Duration
+	tlsCert                        string
+	tlsKey                         string
+	tlsClientCA                    string
+	tlsRequireClientCert           bool
+	heartbeatTimeout               time.Duration
+	reconcileInterval              time.Duration
+	cleanupInterval                time.Duration
+	queueAgingWindowSeconds        int64
+	maxConcurrentRetriesPerWorker  int
+	preemptBacklogThreshold        int
+	preemptHighPriorityMinimumPriority int
 	jobsRetentionCompletedDays int
 	artifactsRetentionDays     int
 	eventsRetentionDays       int
@@ -618,12 +631,20 @@ func parseConfig() controlConfig {
 	var heartbeatSec int64
 	var reconcileSec int64
 	var cleanupIntervalSec int64
+	var queueAgingWindowSeconds int64
+	var maxConcurrentRetriesPerWorker int64
+	var preemptBacklogThreshold int64
+	var preemptHighPriorityMinimumPriority int64
 	var jobsRetentionCompletedDays int64
 	var artifactsRetentionDays int64
 	var eventsRetentionDays int64
 	flag.Int64Var(&heartbeatSec, "heartbeat-timeout-seconds", int64(getenvInt("HDCF_HEARTBEAT_TIMEOUT_SECONDS", 60)), "heartbeat timeout seconds")
 	flag.Int64Var(&reconcileSec, "reconcile-interval-seconds", int64(getenvInt("HDCF_RECONCILE_INTERVAL_SECONDS", 10)), "reconcile interval seconds")
 	flag.Int64Var(&cleanupIntervalSec, "cleanup-interval-seconds", getenvInt("HDCF_CLEANUP_INTERVAL_SECONDS", 300), "cleanup interval seconds")
+	flag.Int64Var(&queueAgingWindowSeconds, "queue-aging-window-seconds", getenvInt("HDCF_QUEUE_AGING_WINDOW_SECONDS", 0), "aging window seconds for priority-based fairness")
+	flag.Int64Var(&maxConcurrentRetriesPerWorker, "max-retry-concurrency-per-worker", getenvInt("HDCF_MAX_RETRY_CONCURRENCY_PER_WORKER", 0), "max concurrent retry jobs per worker (0=unlimited)")
+	flag.Int64Var(&preemptBacklogThreshold, "preempt-high-priority-backlog-threshold", getenvInt("HDCF_PREEMPT_HIGH_PRIORITY_BACKLOG_THRESHOLD", 0), "if high-priority backlog exceeds threshold, temporarily gate lower priority jobs")
+	flag.Int64Var(&preemptHighPriorityMinimumPriority, "preempt-high-priority-floor", getenvInt("HDCF_PREEMPT_HIGH_PRIORITY_FLOOR", 0), "minimum priority during preemption mode")
 	flag.Int64Var(&jobsRetentionCompletedDays, "jobs-retention-completed-days", getenvInt("HDCF_JOBS_RETENTION_COMPLETED_DAYS", 30), "days to retain terminal jobs in sqlite")
 	flag.Int64Var(&artifactsRetentionDays, "artifacts-retention-days", getenvInt("HDCF_ARTIFACTS_RETENTION_DAYS", 14), "days to retain terminal artifact/log files (cleanup does not block scheduling)")
 	flag.Int64Var(&eventsRetentionDays, "events-retention-days", getenvInt("HDCF_EVENTS_RETENTION_DAYS", 30), "days to retain audit events")
@@ -640,6 +661,10 @@ func parseConfig() controlConfig {
 	cfg.heartbeatTimeout = time.Duration(heartbeatSec) * time.Second
 	cfg.reconcileInterval = time.Duration(reconcileSec) * time.Second
 	cfg.cleanupInterval = time.Duration(cleanupIntervalSec) * time.Second
+	cfg.queueAgingWindowSeconds = queueAgingWindowSeconds
+	cfg.maxConcurrentRetriesPerWorker = int(maxConcurrentRetriesPerWorker)
+	cfg.preemptBacklogThreshold = int(preemptBacklogThreshold)
+	cfg.preemptHighPriorityMinimumPriority = int(preemptHighPriorityMinimumPriority)
 	cfg.jobsRetentionCompletedDays = int(jobsRetentionCompletedDays)
 	cfg.artifactsRetentionDays = int(artifactsRetentionDays)
 	cfg.eventsRetentionDays = int(eventsRetentionDays)

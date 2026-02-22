@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,8 +16,19 @@ import (
 )
 
 type Store struct {
-	db               *sql.DB
-	heartbeatTimeout time.Duration
+	db                                 *sql.DB
+	heartbeatTimeout                   time.Duration
+	queueAgingWindowSeconds            int64
+	maxConcurrentRetriesPerWorker      int
+	preemptBacklogThreshold            int
+	preemptHighPriorityMinimumPriority int
+}
+
+type StoreOptions struct {
+	QueueAgingWindowSeconds           int64
+	MaxConcurrentRetriesPerWorker      int
+	PreemptBacklogThreshold           int
+	PreemptHighPriorityMinimumPriority int
 }
 
 type auditRequestIDKey struct{}
@@ -44,7 +56,7 @@ func requestIDFromContext(ctx context.Context) string {
 	return strings.TrimSpace(requestID)
 }
 
-func Open(path string, heartbeatTimeout time.Duration) (*Store, error) {
+func Open(path string, heartbeatTimeout time.Duration, options StoreOptions) (*Store, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
@@ -58,7 +70,27 @@ func Open(path string, heartbeatTimeout time.Duration) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{db: db, heartbeatTimeout: heartbeatTimeout}
+	if options.QueueAgingWindowSeconds < 0 {
+		options.QueueAgingWindowSeconds = 0
+	}
+	if options.MaxConcurrentRetriesPerWorker < 0 {
+		options.MaxConcurrentRetriesPerWorker = 0
+	}
+	if options.PreemptBacklogThreshold < 0 {
+		options.PreemptBacklogThreshold = 0
+	}
+	if options.PreemptHighPriorityMinimumPriority < 0 {
+		options.PreemptHighPriorityMinimumPriority = 0
+	}
+
+	s := &Store{
+		db:                                 db,
+		heartbeatTimeout:                   heartbeatTimeout,
+		queueAgingWindowSeconds:            options.QueueAgingWindowSeconds,
+		maxConcurrentRetriesPerWorker:       options.MaxConcurrentRetriesPerWorker,
+		preemptBacklogThreshold:             options.PreemptBacklogThreshold,
+		preemptHighPriorityMinimumPriority:  options.PreemptHighPriorityMinimumPriority,
+	}
 	if err := s.initSchema(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -100,6 +132,10 @@ func (s *Store) initSchema(ctx context.Context) error {
 		artifact_stderr_tmp_path TEXT,
 		artifact_stderr_path TEXT,
 		artifact_stderr_sha256 TEXT,
+		artifact_storage_backend TEXT NOT NULL DEFAULT 'local',
+		artifact_storage_location TEXT,
+		artifact_upload_state TEXT,
+		artifact_upload_error TEXT,
 		updated_by TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at);
@@ -322,6 +358,10 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 		{name: "artifact_stderr_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_tmp_path TEXT"},
 		{name: "artifact_stderr_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_path TEXT"},
 		{name: "artifact_stderr_sha256", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stderr_sha256 TEXT"},
+		{name: "artifact_storage_backend", ddl: "ALTER TABLE jobs ADD COLUMN artifact_storage_backend TEXT NOT NULL DEFAULT 'local'"},
+		{name: "artifact_storage_location", ddl: "ALTER TABLE jobs ADD COLUMN artifact_storage_location TEXT"},
+		{name: "artifact_upload_state", ddl: "ALTER TABLE jobs ADD COLUMN artifact_upload_state TEXT"},
+		{name: "artifact_upload_error", ddl: "ALTER TABLE jobs ADD COLUMN artifact_upload_error TEXT"},
 		{name: "completion_seq", ddl: "ALTER TABLE jobs ADD COLUMN completion_seq INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, col := range need {
@@ -448,6 +488,85 @@ func workerCapabilitiesMatch(workerCaps []string, needsGPU bool, requirementsJSO
 	return hasAllCapabilities(workerCaps, required)
 }
 
+func workerMaxRetryLimit(workerCaps []string, fallback int) int {
+	limit := fallback
+	for _, raw := range workerCaps {
+		capability := strings.TrimSpace(strings.ToLower(raw))
+		if capability == "" {
+			continue
+		}
+		parts := strings.SplitN(capability, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		if key != "max_retries_per_worker" && key != "max-retries-per-worker" {
+			continue
+		}
+		parsed, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			continue
+		}
+		if parsed >= 0 {
+			limit = parsed
+		}
+	}
+	return limit
+}
+
+func (s *Store) getWorkerRetryLimit(ctx context.Context, tx *sql.Tx, workerID string) (int, error) {
+	workerCaps, err := s.getWorkerCapabilitiesTx(ctx, tx, workerID)
+	if err != nil {
+		return 0, err
+	}
+	return workerMaxRetryLimit(workerCaps, s.maxConcurrentRetriesPerWorker), nil
+}
+
+func (s *Store) preemptPriorityFloor(ctx context.Context, tx *sql.Tx, nowSec int64) (int, error) {
+	if s.preemptBacklogThreshold <= 0 || s.preemptHighPriorityMinimumPriority <= 0 {
+		return 0, nil
+	}
+	var backlog int
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(1)
+		   FROM jobs
+		   WHERE status = ?
+		     AND scheduled_at <= ?
+		     AND priority >= ?
+		     AND attempt_count < max_attempts`,
+		hdcf.StatusPending,
+		nowSec,
+		s.preemptHighPriorityMinimumPriority,
+	).Scan(&backlog)
+	if err != nil {
+		return 0, err
+	}
+	if backlog > s.preemptBacklogThreshold {
+		return s.preemptHighPriorityMinimumPriority, nil
+	}
+	return 0, nil
+}
+
+func (s *Store) workerActiveRetryCount(ctx context.Context, tx *sql.Tx, workerID string) (int, error) {
+	var activeRetries int
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT COUNT(1)
+		   FROM jobs
+		   WHERE worker_id = ?
+		     AND status IN (?, ?)
+		     AND attempt_count > 1`,
+		workerID,
+		hdcf.StatusAssigned,
+		hdcf.StatusRunning,
+	).Scan(&activeRetries)
+	if err != nil {
+		return 0, err
+	}
+	return activeRetries, nil
+}
+
 func (s *Store) getWorkerCapabilitiesTx(ctx context.Context, tx *sql.Tx, workerID string) ([]string, error) {
 	var capabilitiesJSON string
 	if err := tx.QueryRowContext(ctx, `SELECT worker_capabilities FROM workers WHERE worker_id = ?`, workerID).Scan(&capabilitiesJSON); err != nil {
@@ -539,7 +658,9 @@ func (s *Store) ListJobs(ctx context.Context, statusFilter, workerIDFilter strin
 	query := `
 		SELECT j.id, j.status, j.command, j.args, j.working_dir, j.timeout_ms, j.priority, j.scheduled_at, j.needs_gpu, j.requirements, j.created_at, j.updated_at,
 		       j.attempt_count, j.max_attempts, j.worker_id, j.assignment_id, j.assignment_expires_at,
-		       j.last_error, j.result_path, j.updated_by, w.last_seen
+		       j.last_error, j.result_path, j.updated_by,
+		       j.artifact_storage_backend, j.artifact_storage_location, j.artifact_upload_state, j.artifact_upload_error,
+		       w.last_seen
 		FROM jobs j
 		LEFT JOIN workers w ON w.worker_id = j.worker_id
 	`
@@ -595,9 +716,16 @@ func (s *Store) ListJobs(ctx context.Context, statusFilter, workerIDFilter strin
 			&job.LastError,
 			&job.ResultPath,
 			&job.UpdatedBy,
+			&job.ArtifactStorageBackend,
+			&job.ArtifactLocation,
+			&job.ArtifactUploadState,
+			&job.ArtifactUploadError,
 			&workerLastSeen,
 		); err != nil {
 			return nil, err
+		}
+		if strings.TrimSpace(job.ArtifactStorageBackend) == "" {
+			job.ArtifactStorageBackend = hdcf.ArtifactStorageBackendLocal
 		}
 		if workerID.Valid {
 			job.WorkerID = strings.TrimSpace(workerID.String)
@@ -644,7 +772,9 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, e
 	query := `
 		SELECT j.id, j.status, j.command, j.args, j.working_dir, j.timeout_ms, j.priority, j.scheduled_at, j.needs_gpu, j.requirements, j.created_at, j.updated_at,
 		       j.attempt_count, j.max_attempts, j.worker_id, j.assignment_id, j.assignment_expires_at,
-		       j.last_error, j.result_path, j.updated_by, w.last_seen
+		       j.last_error, j.result_path, j.updated_by,
+		       j.artifact_storage_backend, j.artifact_storage_location, j.artifact_upload_state, j.artifact_upload_error,
+		       w.last_seen
 		FROM jobs j
 		LEFT JOIN workers w ON w.worker_id = j.worker_id
 		WHERE j.id = ?
@@ -678,12 +808,19 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, e
 		&job.LastError,
 		&job.ResultPath,
 		&job.UpdatedBy,
+		&job.ArtifactStorageBackend,
+		&job.ArtifactLocation,
+		&job.ArtifactUploadState,
+		&job.ArtifactUploadError,
 		&workerLastSeen,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return hdcf.JobRead{}, false, nil
 		}
 		return hdcf.JobRead{}, false, err
+	}
+	if strings.TrimSpace(job.ArtifactStorageBackend) == "" {
+		job.ArtifactStorageBackend = hdcf.ArtifactStorageBackendLocal
 	}
 	if workerID.Valid {
 		job.WorkerID = strings.TrimSpace(workerID.String)
@@ -969,13 +1106,37 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 	assignmentID := hdcf.NewJobID()
 	assignmentExpiresAt := now.Add(s.heartbeatTimeout).Unix()
 
-	candidates, err := tx.QueryContext(
-		ctx,
-		`SELECT id, command, args, working_dir, timeout_ms, attempt_count, max_attempts, needs_gpu, requirements
+	retryLimit, err := s.getWorkerRetryLimit(ctx, tx, workerID)
+	if err != nil {
+		return nil, false, err
+	}
+	retryInFlight := 0
+	if retryLimit > 0 {
+		retryInFlight, err = s.workerActiveRetryCount(ctx, tx, workerID)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	retryAllowed := 1
+	if retryLimit > 0 && retryInFlight >= retryLimit {
+		retryAllowed = 0
+	}
+
+	preemptFloor, err := s.preemptPriorityFloor(ctx, tx, nowSec)
+	if err != nil {
+		return nil, false, err
+	}
+
+	orderBy := "ORDER BY j.priority DESC, j.created_at ASC, j.id ASC"
+	if s.queueAgingWindowSeconds > 0 {
+		orderBy = "ORDER BY (j.priority + ((? - j.created_at) / " + strconv.FormatInt(s.queueAgingWindowSeconds, 10) + ")) DESC, j.priority DESC, j.created_at ASC, j.id ASC"
+	}
+	query := `SELECT id, command, args, working_dir, timeout_ms, attempt_count, max_attempts, needs_gpu, requirements
 		FROM jobs
 		WHERE status = ?
 		  AND attempt_count < max_attempts
 		  AND scheduled_at <= ?
+		  AND ( ? = 1 OR attempt_count <= 1 )
 		  AND (
 			worker_id IS NULL
 			OR worker_id = ''
@@ -985,13 +1146,24 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 					AND w.status = 'ONLINE'
 		      AND w.last_seen >= ?
 			)
-		  )
-		ORDER BY priority DESC, created_at ASC, id ASC
-		LIMIT 64`,
+		  )`
+	args := []any{
 		hdcf.StatusPending,
 		nowSec,
+		retryAllowed,
 		cutoff,
-	)
+	}
+	if preemptFloor > 0 {
+		query += ` AND priority >= ?`
+		args = append(args, preemptFloor)
+	}
+	if s.queueAgingWindowSeconds > 0 {
+		query += " " + orderBy + " LIMIT 64"
+		args = append(args, nowSec)
+	} else {
+		query += " " + orderBy + " LIMIT 64"
+	}
+	candidates, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1055,6 +1227,10 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 			"assignment_id":       assignmentID,
 			"attempt_count":       job.AttemptCount,
 			"assignment_expires_at": assignmentExpiresAt,
+			"retry_allowed":        retryAllowed == 1,
+			"retry_limit":          retryLimit,
+			"retry_in_flight":      retryInFlight,
+			"preempt_priority_floor": preemptFloor,
 		})
 		if err := tx.Commit(); err != nil {
 			return nil, false, err
@@ -1366,6 +1542,11 @@ func (s *Store) ReconnectWorker(ctx context.Context, req hdcf.WorkerReconnectReq
 				StderrTmpPath: completed.StderrTmpPath,
 				StdoutSHA256: completed.StdoutSHA256,
 				StderrSHA256: completed.StderrSHA256,
+				CompletionSeq: completed.CompletionSeq,
+				ArtifactBackend: completed.ArtifactBackend,
+				ArtifactLocation: completed.ArtifactLocation,
+				ArtifactUploadState: completed.ArtifactUploadState,
+				ArtifactUploadError: completed.ArtifactUploadError,
 				ResultSummary: completed.ResultSummary,
 			})
 			if err != nil {
@@ -1568,26 +1749,23 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	if !hdcf.IsValidTransition(currentStatus, hdcf.StatusCompleted) {
 		return fmt.Errorf("invalid transition %s -> %s", currentStatus, hdcf.StatusCompleted)
 	}
+	artifactBackend := hdcf.NormalizeArtifactStorageBackend(req.ArtifactBackend)
+	artifactUploadState := strings.TrimSpace(req.ArtifactUploadState)
+	if artifactUploadState == "" {
+		artifactUploadState = hdcf.ArtifactUploadStateOK
+	}
+	artifactLocation := strings.TrimSpace(req.ArtifactLocation)
+	if !hdcf.IsValidArtifactStorageBackend(artifactBackend) {
+		return fmt.Errorf("unsupported artifact backend: %s", artifactBackend)
+	}
+	if artifactBackend == hdcf.ArtifactStorageBackendS3 {
+		return fmt.Errorf("artifact backend %s is not yet supported", artifactBackend)
+	}
+	if artifactBackend == hdcf.ArtifactStorageBackendNFS && artifactLocation == "" {
+		return fmt.Errorf("artifact_location required for nfs backend")
+	}
 	if strings.TrimSpace(req.ArtifactID) == "" {
 		return fmt.Errorf("artifact_id required")
-	}
-	if strings.TrimSpace(req.StdoutPath) == "" {
-		return fmt.Errorf("stdout_path required")
-	}
-	if strings.TrimSpace(req.StderrPath) == "" {
-		return fmt.Errorf("stderr_path required")
-	}
-	if strings.TrimSpace(req.StdoutTmpPath) == "" {
-		return fmt.Errorf("stdout_tmp_path required")
-	}
-	if strings.TrimSpace(req.StderrTmpPath) == "" {
-		return fmt.Errorf("stderr_tmp_path required")
-	}
-	if err := validateCompletedArtifact(req.StdoutPath, req.StdoutTmpPath, "stdout"); err != nil {
-		return err
-	}
-	if err := validateCompletedArtifact(req.StderrPath, req.StderrTmpPath, "stderr"); err != nil {
-		return err
 	}
 	if workerID.Valid && workerID.String != req.WorkerID {
 		return fmt.Errorf("job worker mismatch for completion")
@@ -1601,12 +1779,32 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	if strings.TrimSpace(req.AssignmentID) != assignmentID.String {
 		return fmt.Errorf("assignment_id mismatch")
 	}
+	if artifactUploadState == hdcf.ArtifactUploadStateOK && strings.TrimSpace(req.StdoutPath) == "" {
+		return fmt.Errorf("stdout_path required")
+	}
+	if artifactUploadState == hdcf.ArtifactUploadStateOK && strings.TrimSpace(req.StderrPath) == "" {
+		return fmt.Errorf("stderr_path required")
+	}
+	if artifactUploadState == hdcf.ArtifactUploadStateOK && strings.TrimSpace(req.StdoutTmpPath) == "" {
+		return fmt.Errorf("stdout_tmp_path required")
+	}
+	if artifactUploadState == hdcf.ArtifactUploadStateOK && strings.TrimSpace(req.StderrTmpPath) == "" {
+		return fmt.Errorf("stderr_tmp_path required")
+	}
+	if artifactUploadState == hdcf.ArtifactUploadStateOK {
+		if err := validateCompletedArtifact(req.StdoutPath, req.StdoutTmpPath, "stdout"); err != nil {
+			return err
+		}
+		if err := validateCompletedArtifact(req.StderrPath, req.StderrTmpPath, "stderr"); err != nil {
+			return err
+		}
+	}
 
 	if req.CompletionSeq > 0 {
 		_, err = tx.ExecContext(
 			ctx,
 			`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
-			 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, completion_seq = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+			 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, artifact_storage_backend = ?, artifact_storage_location = ?, artifact_upload_state = ?, artifact_upload_error = ?, completion_seq = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
 			hdcf.StatusCompleted,
 			req.StdoutPath,
 			req.ArtifactID,
@@ -1616,6 +1814,10 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 			req.StderrTmpPath,
 			req.StderrPath,
 			req.StderrSHA256,
+			artifactBackend,
+			artifactLocation,
+			artifactUploadState,
+			strings.TrimSpace(req.ArtifactUploadError),
 			req.CompletionSeq,
 			req.ResultSummary,
 			time.Now().Unix(),
@@ -1626,7 +1828,7 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 		_, err = tx.ExecContext(
 			ctx,
 			`UPDATE jobs SET status = ?, worker_id = NULL, assignment_id = NULL, assignment_expires_at = NULL,
-			 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
+			 result_path = ?, artifact_id = ?, artifact_stdout_tmp_path = ?, artifact_stdout_path = ?, artifact_stdout_sha256 = ?, artifact_stderr_tmp_path = ?, artifact_stderr_path = ?, artifact_stderr_sha256 = ?, artifact_storage_backend = ?, artifact_storage_location = ?, artifact_upload_state = ?, artifact_upload_error = ?, last_error = ?, updated_at = ?, updated_by = ? WHERE id = ?`,
 			hdcf.StatusCompleted,
 			req.StdoutPath,
 			req.ArtifactID,
@@ -1636,6 +1838,10 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 			req.StderrTmpPath,
 			req.StderrPath,
 			req.StderrSHA256,
+			artifactBackend,
+			artifactLocation,
+			artifactUploadState,
+			strings.TrimSpace(req.ArtifactUploadError),
 			req.ResultSummary,
 			time.Now().Unix(),
 			req.WorkerID,
@@ -1650,6 +1856,9 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 		"to_status":           hdcf.StatusCompleted,
 		"assignment_id":       req.AssignmentID,
 		"artifact_id":         req.ArtifactID,
+		"artifact_backend":     artifactBackend,
+		"artifact_location":    artifactLocation,
+		"artifact_upload_state": artifactUploadState,
 		"completion_seq":      req.CompletionSeq,
 		"stdout":              req.StdoutPath,
 		"stderr":              req.StderrPath,
