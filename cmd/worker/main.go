@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
-	"encoding/hex"
+	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -36,6 +40,8 @@ func main() {
 		nonce:            cfg.nonce,
 		capabilities:     cfg.capabilities,
 		token:            cfg.token,
+		workerTokenSecret: cfg.workerTokenSecret,
+		workerTokenTTL:    cfg.workerTokenTTL,
 		pollInterval:     cfg.pollInterval,
 		heartbeatInterval: cfg.heartbeatInterval,
 		requestTimeout:    cfg.requestTimeout,
@@ -51,7 +57,10 @@ func main() {
 	if err := os.MkdirAll(runner.logDir, 0o755); err != nil {
 		log.Fatalf("log directory: %v", err)
 	}
-	client := &http.Client{Timeout: cfg.requestTimeout}
+	client, err := buildWorkerHTTPClient(cfg)
+	if err != nil {
+		log.Fatalf("http client: %v", err)
+	}
 	runner.httpClient = client
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -98,6 +107,8 @@ type workerConfig struct {
 	nonce             string
 	capabilities      []string
 	token             string
+	workerTokenSecret string
+	workerTokenTTL    time.Duration
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
 	requestTimeout    time.Duration
@@ -106,15 +117,24 @@ type workerConfig struct {
 	logRetentionDays  int
 	logCleanupInterval time.Duration
 	reportMetrics     bool
+	tlsCA            string
+	tlsClientCert    string
+	tlsClientKey     string
 }
 
 func parseWorkerConfig() workerConfig {
 	var cfg workerConfig
+	var token string
 	flag.StringVar(&cfg.controlURL, "control-url", getenv("HDCF_CONTROL_URL", "http://localhost:8080"), "control plane url")
 	flag.StringVar(&cfg.workerID, "worker-id", getenv("HDCF_WORKER_ID", ""), "worker id")
 	flag.StringVar(&cfg.nonce, "worker-nonce", getenv("HDCF_WORKER_NONCE", ""), "optional registration nonce")
 	capabilities := flag.String("capabilities", getenv("HDCF_WORKER_CAPABILITIES", ""), "comma-separated worker capabilities")
-	flag.StringVar(&cfg.token, "token", getenv("HDCF_API_TOKEN", "dev-token"), "api token")
+	flag.StringVar(&token, "token", getenv("HDCF_API_TOKEN", "dev-token"), "legacy api token")
+	var workerToken string
+	flag.StringVar(&workerToken, "worker-token", getenv("HDCF_WORKER_TOKEN", ""), "worker token")
+	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", getenv("HDCF_WORKER_TOKEN_SECRET", ""), "secret for signed worker tokens")
+	var tokenTTLSeconds int
+	flag.IntVar(&tokenTTLSeconds, "worker-token-ttl-seconds", int(getenvInt("HDCF_WORKER_TOKEN_TTL_SECONDS", 3600)), "signed worker token ttl seconds")
 	var pollSec int
 	var heartbeatSec int
 	var timeoutSec int
@@ -128,8 +148,19 @@ func parseWorkerConfig() workerConfig {
 	flag.IntVar(&logCleanupIntervalSec, "log-cleanup-interval-seconds", int(getenvInt("HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS", 300)), "log cleanup interval seconds")
 	flag.StringVar(&cfg.logDir, "log-dir", "worker-logs", "path for local job logs")
 	flag.StringVar(&cfg.stateFile, "state-file", "", "path to reconnect state file (default worker-logs/worker-state.json)")
+	flag.StringVar(&cfg.tlsCA, "tls-ca", getenv("HDCF_TLS_CA", ""), "trusted control plane CA certificate")
+	flag.StringVar(&cfg.tlsClientCert, "tls-client-cert", getenv("HDCF_TLS_CLIENT_CERT", ""), "client certificate for mTLS")
+	flag.StringVar(&cfg.tlsClientKey, "tls-client-key", getenv("HDCF_TLS_CLIENT_KEY", ""), "client private key for mTLS")
 	flag.Parse()
 
+	cfg.token = strings.TrimSpace(workerToken)
+	if cfg.token == "" {
+		cfg.token = strings.TrimSpace(token)
+	}
+	if tokenTTLSeconds < 1 {
+		tokenTTLSeconds = 1
+	}
+	cfg.workerTokenTTL = time.Duration(tokenTTLSeconds) * time.Second
 	cfg.pollInterval = time.Duration(pollSec) * time.Second
 	cfg.heartbeatInterval = time.Duration(heartbeatSec) * time.Second
 	cfg.requestTimeout = time.Duration(timeoutSec) * time.Second
@@ -144,6 +175,40 @@ func parseWorkerConfig() workerConfig {
 	}
 	cfg.capabilities = splitCapabilities(*capabilities)
 	return cfg
+}
+
+func buildWorkerHTTPClient(cfg workerConfig) (*http.Client, error) {
+	transport := &http.Transport{}
+	if !strings.HasPrefix(cfg.controlURL, "https://") {
+		return &http.Client{Timeout: cfg.requestTimeout, Transport: transport}, nil
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if cfg.tlsCA != "" {
+		caBundle, err := os.ReadFile(cfg.tlsCA)
+		if err != nil {
+			return nil, fmt.Errorf("read tls ca: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caBundle) {
+			return nil, fmt.Errorf("parse tls ca: no certificates")
+		}
+		tlsConfig.RootCAs = pool
+	}
+	if (cfg.tlsClientCert != "" && cfg.tlsClientKey == "") || (cfg.tlsClientCert == "" && cfg.tlsClientKey != "") {
+		return nil, fmt.Errorf("both -tls-client-cert and -tls-client-key are required when using client certificate auth")
+	}
+	if cfg.tlsClientCert != "" && cfg.tlsClientKey != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.tlsClientCert, cfg.tlsClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("load tls client keypair: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+	transport.TLSClientConfig = tlsConfig
+	return &http.Client{Timeout: cfg.requestTimeout, Transport: transport}, nil
 }
 
 func getenv(name, fallback string) string {
@@ -189,6 +254,8 @@ type workerRunner struct {
 	nonce             string
 	capabilities      []string
 	token             string
+	workerTokenSecret string
+	workerTokenTTL    time.Duration
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
 	requestTimeout    time.Duration
@@ -700,7 +767,7 @@ func (r *workerRunner) postJSON(ctx context.Context, endpoint string, payload []
 	}
 	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(authHeader, r.token)
+	req.Header.Set(authHeader, r.workerAuthToken())
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -737,7 +804,7 @@ func (r *workerRunner) postJSONWithResponse(ctx context.Context, endpoint string
 	}
 	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(authHeader, r.token)
+	req.Header.Set(authHeader, r.workerAuthToken())
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		workerEvent("warn", "worker.http_request", map[string]any{
@@ -777,6 +844,35 @@ func (r *workerRunner) postJSONWithResponse(ctx context.Context, endpoint string
 		"actions":   len(parsed.Actions),
 	})
 	return parsed, nil
+}
+
+func (r *workerRunner) workerAuthToken() string {
+	if strings.TrimSpace(r.workerTokenSecret) == "" {
+		return r.token
+	}
+	signed, err := makeSignedWorkerToken(r.workerID, r.workerTokenTTL, r.workerTokenSecret)
+	if err != nil {
+		workerEvent("warn", "worker.token", map[string]any{
+			"worker_id": r.workerID,
+			"error":     err.Error(),
+		})
+		return r.token
+	}
+	return signed
+}
+
+func makeSignedWorkerToken(workerID string, ttl time.Duration, secret string) (string, error) {
+	if strings.TrimSpace(secret) == "" || strings.TrimSpace(workerID) == "" {
+		return "", fmt.Errorf("invalid token inputs")
+	}
+	expiresAt := time.Now().Add(ttl).Unix()
+	nonce := hdcf.NewJobID()
+	payload := fmt.Sprintf("%s|%d|%s", workerID, expiresAt, nonce)
+	encodedPayload := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(encodedPayload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return fmt.Sprintf("v1.%s.%s", encodedPayload, sig), nil
 }
 
 func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
