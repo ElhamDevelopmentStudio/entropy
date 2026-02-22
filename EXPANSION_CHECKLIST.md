@@ -192,8 +192,8 @@ Progress:
 - Added control-plane aggregation for queue depth by state, worker totals, retry/loss counts, completion/failure rates, and completion lag.
 - Optional alert/webhook hooks still to add for hard events.
 
-12. `[~]` P5-12 — Multi-worker operational readiness
-Current status: started with concurrent claim safety test coverage
+12. `[x]` P5-12 — Multi-worker operational readiness
+Current status: complete
 Target: all control-plane scheduling paths
 Implementation tasks:
 - Validate assignment claims under concurrent workers.
@@ -205,7 +205,9 @@ Acceptance criteria:
 Progress:
 - Added `TestClaimNextJobConcurrentWorkersAreMutualExclusive` to validate claim behavior under concurrent workers.
 - Added `TestRecoverStaleRunningJobIsReclaimedAndReassigned` to validate stale-worker handoff and retry-window re-queueing.
-- Hardening of claim/stale-worker logic under contention and end-to-end multi-worker stress scenario still pending.
+- Added `TestMultiWorkerStressAndRecoveryUnderContention` to validate end-to-end claim/processing under concurrent workers and stale-assignment recovery under contention.
+- Added parallel `RecoverStaleWorkers` call coverage for contention.
+- Added end-to-end completion verification for all jobs after recovery and reprocessing.
 
 13. `[ ]` P5-13 — Config and deployment hardening
 Current status: env/flags only

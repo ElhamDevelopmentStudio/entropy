@@ -338,6 +338,219 @@ func TestRecoverStaleRunningJobIsReclaimedAndReassigned(t *testing.T) {
 	}
 }
 
+func TestMultiWorkerStressAndRecoveryUnderContention(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	const (
+		jobCount          = 180
+		workerCount       = 12
+		staleJobsToLeave  = 24
+		recoveryWorkers   = 4
+		recoveryIterations = 4
+	)
+
+	for i := 0; i < jobCount; i++ {
+		if _, err := s.CreateJob(ctx, hdcf.CreateJobRequest{
+			Command:     "sleep",
+			Args:        []string{"1"},
+			MaxAttempts: 2,
+		}); err != nil {
+			t.Fatalf("create job %d: %v", i, err)
+		}
+	}
+
+	staleWorkerID := "stale-worker"
+	if err := s.RegisterWorker(ctx, hdcf.RegisterWorkerRequest{WorkerID: staleWorkerID}); err != nil {
+		t.Fatalf("register stale worker: %v", err)
+	}
+
+	workers := make([]string, 0, workerCount)
+	for i := 0; i < workerCount; i++ {
+		workerID := "worker-" + strconv.Itoa(i)
+		if err := s.RegisterWorker(ctx, hdcf.RegisterWorkerRequest{WorkerID: workerID}); err != nil {
+			t.Fatalf("register worker %s: %v", workerID, err)
+		}
+		workers = append(workers, workerID)
+	}
+
+	var staleMu sync.Mutex
+	staleJobIDs := make([]string, 0, staleJobsToLeave)
+	var staleCaptureErr atomicError
+	staleDone := make(chan struct{})
+	staleDoneOnce := sync.Once{}
+	var staleWG sync.WaitGroup
+	staleWG.Add(1)
+	go func() {
+		defer staleWG.Done()
+		for {
+			assigned, ok, err := s.ClaimNextJob(ctx, staleWorkerID)
+			if err != nil {
+				staleCaptureErr.set(err)
+				return
+			}
+			if !ok || assigned == nil {
+				return
+			}
+			staleMu.Lock()
+			if len(staleJobIDs) < staleJobsToLeave {
+				staleJobIDs = append(staleJobIDs, assigned.JobID)
+			}
+			reached := len(staleJobIDs) >= staleJobsToLeave
+			staleMu.Unlock()
+			if reached {
+				staleDoneOnce.Do(func() {
+					close(staleDone)
+				})
+				return
+			}
+		}
+	}()
+
+	<-staleDone
+	staleWG.Wait()
+	if err := staleCaptureErr.get(); err != nil {
+		t.Fatalf("stale worker capture: %v", err)
+	}
+	staleMu.Lock()
+	if got := len(staleJobIDs); got != staleJobsToLeave {
+		staleMu.Unlock()
+		t.Fatalf("expected to leave %d stale assignments, got %d", staleJobsToLeave, got)
+	}
+	staleMu.Unlock()
+
+	now := time.Now().Unix()
+	if _, err := s.db.ExecContext(
+		ctx,
+		`UPDATE workers SET status = 'OFFLINE', last_seen = ? WHERE worker_id = ?`,
+		now-2*int64(s.heartbeatTimeout.Seconds())-10,
+		staleWorkerID,
+	); err != nil {
+		t.Fatalf("offline stale worker: %v", err)
+	}
+	if _, err := s.db.ExecContext(
+		ctx,
+		`UPDATE jobs SET assignment_expires_at = ? WHERE worker_id = ? AND status = 'ASSIGNED'`,
+		now-2*int64(s.heartbeatTimeout.Seconds())-10,
+		staleWorkerID,
+	); err != nil {
+		t.Fatalf("expire stale assignments: %v", err)
+	}
+
+	var processErr atomicError
+	var recoveryErr atomicError
+	var recoveryWG sync.WaitGroup
+	for i := 0; i < recoveryWorkers; i++ {
+		recoveryWG.Add(1)
+		go func() {
+			defer recoveryWG.Done()
+			for i := 0; i < recoveryIterations; i++ {
+				if err := s.RecoverStaleWorkers(ctx); err != nil {
+					recoveryErr.set(err)
+					return
+				}
+			}
+		}()
+	}
+
+	var processingWG sync.WaitGroup
+	for _, workerID := range workers {
+		workerID := workerID
+		processingWG.Add(1)
+		go func() {
+			defer processingWG.Done()
+			for {
+				assigned, ok, err := s.ClaimNextJob(ctx, workerID)
+				if err != nil {
+					processErr.set(err)
+					return
+				}
+				if !ok || assigned == nil {
+					return
+				}
+
+				if err := s.AcknowledgeJob(ctx, hdcf.AckJobRequest{
+					JobID:        assigned.JobID,
+					WorkerID:     workerID,
+					AssignmentID: assigned.AssignmentID,
+				}); err != nil {
+					processErr.set(err)
+					return
+				}
+
+				switch assigned.AttemptCount {
+				case 1:
+					if err := s.FailJob(ctx, hdcf.FailRequest{
+						JobID:       assigned.JobID,
+						WorkerID:    workerID,
+						AssignmentID: assigned.AssignmentID,
+						ExitCode:    1,
+						Error:       "simulated stress failure",
+					}); err != nil {
+						processErr.set(err)
+						return
+					}
+				default:
+					if err := s.CompleteJob(ctx, hdcf.CompleteRequest{
+						JobID:         assigned.JobID,
+						WorkerID:      workerID,
+						AssignmentID:   assigned.AssignmentID,
+						ArtifactID:     "artifact-" + assigned.JobID,
+						ExitCode:       0,
+						StdoutPath:     "/tmp/" + assigned.JobID + ".stdout",
+						StderrPath:     "/tmp/" + assigned.JobID + ".stderr",
+						StdoutTmpPath:  "/tmp/" + assigned.JobID + ".stdout.tmp",
+						StderrTmpPath:  "/tmp/" + assigned.JobID + ".stderr.tmp",
+						ArtifactBackend: hdcf.ArtifactStorageBackendLocal,
+						ArtifactUploadState: hdcf.ArtifactUploadStateOK,
+						CompletionSeq:   1,
+						ResultSummary:   "stress completion",
+					}); err != nil {
+						processErr.set(err)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	recoveryWG.Wait()
+	processingWG.Wait()
+	if err := staleCaptureErr.get(); err != nil {
+		t.Fatalf("stale capture error: %v", err)
+	}
+	if err := recoveryErr.get(); err != nil {
+		t.Fatalf("recovery error: %v", err)
+	}
+	if err := processErr.get(); err != nil {
+		t.Fatalf("processing error: %v", err)
+	}
+
+	for _, jobID := range staleJobIDs {
+		job := mustGetJob(t, s, ctx, jobID)
+		if job.Status != hdcf.StatusCompleted {
+			t.Fatalf("stale job %s should complete after recovery, got %s", jobID, job.Status)
+		}
+	}
+
+	jobs, err := s.ListJobs(ctx, "", "")
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs) != jobCount {
+		t.Fatalf("expected %d jobs, got %d", jobCount, len(jobs))
+	}
+	for _, job := range jobs {
+		if job.Status != hdcf.StatusCompleted {
+			t.Fatalf("job %s should be terminal completed, got %s", job.JobID, job.Status)
+		}
+		if job.AttemptCount < 2 {
+			t.Fatalf("job %s should have at least 2 attempts, got %d", job.JobID, job.AttemptCount)
+		}
+	}
+}
+
 func enqueueAndClaimJob(t *testing.T, s *Store, ctx context.Context) (string, string, string) {
 	t.Helper()
 	resp, err := s.CreateJob(ctx, hdcf.CreateJobRequest{
