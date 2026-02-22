@@ -146,6 +146,7 @@ type WorkerRead struct {
 	Status            string `json:"status"`
 	CurrentJobID      string `json:"current_job_id"`
 	Capabilities      []string `json:"capabilities"`
+	HeartbeatMetrics  map[string]interface{} `json:"heartbeat_metrics,omitempty"`
 	LastSeen          int64  `json:"last_seen"`
 	RegisteredAt      int64  `json:"registered_at"`
 	HeartbeatAgeSec   int64  `json:"heartbeat_age_sec"`
@@ -157,6 +158,14 @@ type HeartbeatRequest struct {
 	CurrentJobID *string `json:"current_job_id"`
 	Timestamp    string  `json:"ts"`
 	Sequence     int64   `json:"seq"`
+	Metrics      *HeartbeatMetrics `json:"metrics,omitempty"`
+}
+
+type HeartbeatMetrics struct {
+	CPUUsagePercent   *float64 `json:"cpu_usage_percent,omitempty"`
+	MemoryUsageMB     *float64 `json:"memory_usage_mb,omitempty"`
+	GPUUsagePercent   *float64 `json:"gpu_usage_percent,omitempty"`
+	GPUMemoryUsageMB  *float64 `json:"gpu_memory_usage_mb,omitempty"`
 }
 
 type RegisterWorkerRequest struct {

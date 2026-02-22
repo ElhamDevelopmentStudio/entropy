@@ -111,7 +111,8 @@ func (s *Store) initSchema(ctx context.Context) error {
 		status TEXT NOT NULL,
 		registered_at INTEGER,
 		registration_nonce TEXT,
-		heartbeat_seq INTEGER NOT NULL DEFAULT 0
+		heartbeat_seq INTEGER NOT NULL DEFAULT 0,
+		heartbeat_metrics TEXT
 	);
 	CREATE TABLE IF NOT EXISTS audit_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,6 +233,33 @@ func (s *Store) logEvent(ctx context.Context, tx *sql.Tx, component, level, even
 	return err
 }
 
+func (s *Store) heartbeatMetricsFromRequest(req hdcf.HeartbeatRequest) (string, bool, error) {
+	if req.Metrics == nil {
+		return "", false, nil
+	}
+	metrics := map[string]any{}
+	if req.Metrics.CPUUsagePercent != nil {
+		metrics["cpu_usage_percent"] = *req.Metrics.CPUUsagePercent
+	}
+	if req.Metrics.MemoryUsageMB != nil {
+		metrics["memory_usage_mb"] = *req.Metrics.MemoryUsageMB
+	}
+	if req.Metrics.GPUUsagePercent != nil {
+		metrics["gpu_usage_percent"] = *req.Metrics.GPUUsagePercent
+	}
+	if req.Metrics.GPUMemoryUsageMB != nil {
+		metrics["gpu_memory_usage_mb"] = *req.Metrics.GPUMemoryUsageMB
+	}
+	if len(metrics) == 0 {
+		return "", false, nil
+	}
+	raw, err := json.Marshal(metrics)
+	if err != nil {
+		return "", true, err
+	}
+	return string(raw), true, nil
+}
+
 func (s *Store) ensureJobColumns(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(jobs)")
 	if err != nil {
@@ -323,6 +351,7 @@ func (s *Store) ensureWorkerColumns(ctx context.Context) error {
 		{name: "registration_nonce", ddl: "ALTER TABLE workers ADD COLUMN registration_nonce TEXT"},
 		{name: "worker_capabilities", ddl: "ALTER TABLE workers ADD COLUMN worker_capabilities TEXT NOT NULL DEFAULT ''"},
 		{name: "heartbeat_seq", ddl: "ALTER TABLE workers ADD COLUMN heartbeat_seq INTEGER NOT NULL DEFAULT 0"},
+		{name: "heartbeat_metrics", ddl: "ALTER TABLE workers ADD COLUMN heartbeat_metrics TEXT"},
 	}
 	for _, col := range need {
 		if _, ok := columns[col.name]; ok {
@@ -668,7 +697,7 @@ func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, e
 func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
 	now := time.Now().Unix()
 	query := `
-		SELECT worker_id, last_seen, current_job_id, status, registered_at, registration_nonce, worker_capabilities
+		SELECT worker_id, last_seen, current_job_id, status, registered_at, registration_nonce, worker_capabilities, heartbeat_metrics
 		FROM workers
 		ORDER BY worker_id
 	`
@@ -683,6 +712,7 @@ func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
 		var w hdcf.WorkerRead
 		var currentJobID sql.NullString
 		var capabilitiesJSON string
+		var heartbeatMetricsJSON sql.NullString
 		if err := rows.Scan(
 			&w.WorkerID,
 			&w.LastSeen,
@@ -691,6 +721,7 @@ func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
 			&w.RegisteredAt,
 			&w.RegistrationNonce,
 			&capabilitiesJSON,
+			&heartbeatMetricsJSON,
 		); err != nil {
 			return nil, err
 		}
@@ -701,6 +732,13 @@ func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
 			if err := json.Unmarshal([]byte(capabilitiesJSON), &w.Capabilities); err != nil {
 				return nil, err
 			}
+		}
+		if heartbeatMetricsJSON.Valid && strings.TrimSpace(heartbeatMetricsJSON.String) != "" {
+			var metrics map[string]interface{}
+			if err := json.Unmarshal([]byte(heartbeatMetricsJSON.String), &metrics); err != nil {
+				return nil, err
+			}
+			w.HeartbeatMetrics = metrics
 		}
 		age := now - w.LastSeen
 		if age < 0 {
@@ -1359,6 +1397,11 @@ func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) 
 		return nil
 	}
 
+	metricsJSON, hasMetrics, metricsErr := s.heartbeatMetricsFromRequest(req)
+	if metricsErr != nil {
+		return metricsErr
+	}
+
 	var currentJob interface{}
 	if req.CurrentJobID == nil || strings.TrimSpace(*req.CurrentJobID) == "" {
 		currentJob = nil
@@ -1369,27 +1412,55 @@ func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) 
 	var res sql.Result
 	var err error
 	if req.Sequence > 0 {
-		res, err = s.db.ExecContext(
-			ctx,
-			`UPDATE workers
-			 SET last_seen = ?, current_job_id = ?, status = 'ONLINE', heartbeat_seq = ?
-			 WHERE worker_id = ? AND heartbeat_seq < ?`,
-			now,
-			currentJob,
-			req.Sequence,
-			workerID,
-			req.Sequence,
-		)
+		if hasMetrics {
+			res, err = s.db.ExecContext(
+				ctx,
+				`UPDATE workers
+				 SET last_seen = ?, current_job_id = ?, status = 'ONLINE', heartbeat_seq = ?, heartbeat_metrics = ?
+				 WHERE worker_id = ? AND heartbeat_seq < ?`,
+				now,
+				currentJob,
+				req.Sequence,
+				metricsJSON,
+				workerID,
+				req.Sequence,
+			)
+		} else {
+			res, err = s.db.ExecContext(
+				ctx,
+				`UPDATE workers
+				 SET last_seen = ?, current_job_id = ?, status = 'ONLINE', heartbeat_seq = ?
+				 WHERE worker_id = ? AND heartbeat_seq < ?`,
+				now,
+				currentJob,
+				req.Sequence,
+				workerID,
+				req.Sequence,
+			)
+		}
 	} else {
-		res, err = s.db.ExecContext(
-			ctx,
-			`UPDATE workers
-			 SET last_seen = ?, current_job_id = ?, status = 'ONLINE'
-			 WHERE worker_id = ?`,
-			now,
-			currentJob,
-			workerID,
-		)
+		if hasMetrics {
+			res, err = s.db.ExecContext(
+				ctx,
+				`UPDATE workers
+				 SET last_seen = ?, current_job_id = ?, status = 'ONLINE', heartbeat_metrics = ?
+				 WHERE worker_id = ?`,
+				now,
+				currentJob,
+				metricsJSON,
+				workerID,
+			)
+		} else {
+			res, err = s.db.ExecContext(
+				ctx,
+				`UPDATE workers
+				 SET last_seen = ?, current_job_id = ?, status = 'ONLINE'
+				 WHERE worker_id = ?`,
+				now,
+				currentJob,
+				workerID,
+			)
+		}
 	}
 	if err != nil {
 		return err

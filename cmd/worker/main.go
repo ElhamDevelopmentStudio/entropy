@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"strings"
 	"sync/atomic"
@@ -39,6 +40,7 @@ func main() {
 		requestTimeout:    cfg.requestTimeout,
 		logDir:           cfg.logDir,
 		stateFile:        cfg.stateFile,
+		reportMetrics:     cfg.reportMetrics,
 	}
 	if runner.logDir == "" {
 		runner.logDir = "worker-logs"
@@ -97,6 +99,7 @@ type workerConfig struct {
 	requestTimeout    time.Duration
 	logDir            string
 	stateFile         string
+	reportMetrics     bool
 }
 
 func parseWorkerConfig() workerConfig {
@@ -111,6 +114,7 @@ func parseWorkerConfig() workerConfig {
 	var timeoutSec int
 	flag.IntVar(&pollSec, "poll-interval-seconds", 3, "poll interval seconds")
 	flag.IntVar(&heartbeatSec, "heartbeat-interval-seconds", 5, "heartbeat interval seconds")
+	flag.BoolVar(&cfg.reportMetrics, "heartbeat-metrics", false, "include optional resource metrics in heartbeat payload")
 	flag.IntVar(&timeoutSec, "request-timeout-seconds", 10, "request timeout seconds")
 	flag.StringVar(&cfg.logDir, "log-dir", "worker-logs", "path for local job logs")
 	flag.StringVar(&cfg.stateFile, "state-file", "", "path to reconnect state file (default worker-logs/worker-state.json)")
@@ -171,6 +175,7 @@ type workerRunner struct {
 	stateMu           sync.Mutex
 	heartbeatSeq      int64
 	completionSeq     int64
+	reportMetrics     bool
 }
 
 type workerReconnectState struct {
@@ -508,6 +513,9 @@ func (r *workerRunner) sendHeartbeat(ctx context.Context, currentJobID *string) 
 		Timestamp:    time.Now().Format(time.RFC3339),
 		Sequence:     seq,
 	}
+	if r.reportMetrics {
+		body.Metrics = r.collectHeartbeatMetrics()
+	}
 	payload, _ := json.Marshal(body)
 	endpoint := fmt.Sprintf("%s/heartbeat", r.controlURL)
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(payload))
@@ -534,6 +542,15 @@ func (r *workerRunner) sendHeartbeat(ctx context.Context, currentJobID *string) 
 		return fmt.Errorf("heartbeat status=%s body=%s", resp.Status, body)
 	}
 	return nil
+}
+
+func (r *workerRunner) collectHeartbeatMetrics() *hdcf.HeartbeatMetrics {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	memoryUsageMB := float64(memStats.Alloc) / (1024 * 1024)
+	return &hdcf.HeartbeatMetrics{
+		MemoryUsageMB: &memoryUsageMB,
+	}
 }
 
 func (r *workerRunner) nextHeartbeatSeq() int64 {
