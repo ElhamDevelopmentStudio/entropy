@@ -87,5 +87,8 @@ Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAIL
 ## Notes
 
 - Jobs are claimed by polling, never pushed.
-- Recovery on stale heartbeat marks `RUNNING` jobs assigned to offline workers back to `PENDING`.
+- Recovery on stale heartbeat marks workers `OFFLINE`, moves `RUNNING` jobs to `LOST`, then recovers:
+  - `LOST` -> `RETRYING` after a timeout window
+  - `RETRYING` -> `PENDING` when retries remain
+  - `RETRYING` -> `FAILED` when retries are exhausted.
 - `timeout_ms` is enforced by worker execution context and reported as a failure when exceeded.

@@ -78,7 +78,7 @@ If worker crashes before ACK, job never remains stuck in `ASSIGNED`.
 Worker cannot move `ASSIGNED` to `RUNNING` without ACK.
 Dependency: P1-01.
 
-3. `[ ]` P1-03 — Add heartbeat-based `OFFLINE` and `LOST` transitions
+3. `[x]` P1-03 — Add heartbeat-based `OFFLINE` and `LOST` transitions
 Requirement source: `SRS.md` Sections 4.2, 4.4.1
 Target: `internal/store/store.go`, `cmd/control/main.go`
 Implementation details:

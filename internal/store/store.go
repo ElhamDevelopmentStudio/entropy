@@ -457,6 +457,7 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	now := time.Now().Unix()
 	cutoff := now - int64(s.heartbeatTimeout.Seconds())
+	lostRetryCutoff := now - int64(2*s.heartbeatTimeout.Seconds())
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
 	})
@@ -476,10 +477,11 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	if _, err := tx.ExecContext(
 		ctx,
 		`UPDATE jobs
-		 SET status = 'PENDING',
+		 SET status = 'LOST',
 		     worker_id = NULL,
 		     assignment_id = NULL,
 		     assignment_expires_at = NULL,
+		     updated_by = 'reconciler',
 		     updated_at = ?
 		 WHERE status = 'RUNNING'
 		   AND worker_id IN (
@@ -493,16 +495,68 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 	if _, err := tx.ExecContext(
 		ctx,
 		`UPDATE jobs
+		 SET status = 'RETRYING',
+		     updated_at = ?,
+		     updated_by = 'reconciler'
+		 WHERE status = 'LOST'
+		   AND updated_at < ?`,
+		now,
+		lostRetryCutoff,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
 		 SET status = 'PENDING',
 		     worker_id = NULL,
 		     assignment_id = NULL,
 		     assignment_expires_at = NULL,
+		     updated_by = 'reconciler',
 		     updated_at = ?
 		 WHERE status = 'ASSIGNED'
 		   AND assignment_expires_at IS NOT NULL
 		   AND assignment_expires_at < ?`,
 		now,
-		now - int64(s.heartbeatTimeout.Seconds()),
+		cutoff,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
+		 SET status = 'PENDING',
+		     worker_id = NULL,
+		     assignment_id = NULL,
+		     assignment_expires_at = NULL,
+		     updated_by = 'reconciler',
+		     updated_at = ?
+		 WHERE status = 'RETRYING'
+		   AND attempt_count < max_attempts
+		   AND updated_at < ?`,
+		now,
+		lostRetryCutoff,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
+		 SET status = 'FAILED',
+		     worker_id = NULL,
+		     assignment_id = NULL,
+		     assignment_expires_at = NULL,
+		     updated_by = 'reconciler',
+		     updated_at = ?,
+		     last_error = 'worker offline'
+		 WHERE status = 'RETRYING'
+		   AND attempt_count >= max_attempts
+		   AND updated_at < ?`,
+		now,
+		lostRetryCutoff,
 	); err != nil {
 		return err
 	}
