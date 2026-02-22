@@ -144,6 +144,57 @@ func TestWorkerRetryAndBackoffHelpers(t *testing.T) {
 	}
 }
 
+func TestWorkerEnsureRegisteredThrottles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	calls := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/register" {
+			http.NotFound(w, req)
+			return
+		}
+		calls++
+		if req.Header.Get(authHeader) != "unit-token" {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+
+	r := &workerRunner{
+		workerID:         "worker-throttle",
+		token:            "unit-token",
+		requestTimeout:   2 * time.Second,
+		registerInterval: 75 * time.Millisecond,
+		controlURL:       ts.URL,
+	}
+	client, err := buildWorkerHTTPClient(workerConfig{controlURL: ts.URL})
+	if err != nil {
+		t.Fatalf("http client: %v", err)
+	}
+	r.httpClient = client
+
+	if err := r.ensureRegistered(ctx, "initial"); err != nil {
+		t.Fatalf("ensureRegistered initial: %v", err)
+	}
+	if err := r.ensureRegistered(ctx, "initial"); err != nil {
+		t.Fatalf("ensureRegistered throttled: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected only one registration due throttle, got %d", calls)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if err := r.ensureRegistered(ctx, "initial"); err != nil {
+		t.Fatalf("ensureRegistered after cooldown: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected second registration after throttle window, got %d", calls)
+	}
+}
+
 func TestWorkerReadLimitedBody(t *testing.T) {
 	t.Parallel()
 	short := readLimitedBody(strings.NewReader("ok"))

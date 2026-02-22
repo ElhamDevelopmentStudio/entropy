@@ -8,8 +8,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,8 +24,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"sync"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,26 +37,27 @@ func main() {
 	cfg := parseWorkerConfig()
 
 	runner := &workerRunner{
-		controlURL:       strings.TrimRight(cfg.controlURL, "/"),
-		workerID:         cfg.workerID,
-		nonce:            cfg.nonce,
-		capabilities:     cfg.capabilities,
-		token:            cfg.token,
-		workerTokenSecret: cfg.workerTokenSecret,
-		workerTokenTTL:    cfg.workerTokenTTL,
-		pollInterval:     cfg.pollInterval,
-		heartbeatInterval: cfg.heartbeatInterval,
-		requestTimeout:    cfg.requestTimeout,
-		logDir:           cfg.logDir,
-		stateFile:        cfg.stateFile,
-		logRetentionDays:  cfg.logRetentionDays,
-		logCleanupInterval: cfg.logCleanupInterval,
-		reportMetrics:     cfg.reportMetrics,
+		controlURL:              strings.TrimRight(cfg.controlURL, "/"),
+		workerID:                cfg.workerID,
+		nonce:                   cfg.nonce,
+		capabilities:            cfg.capabilities,
+		token:                   cfg.token,
+		workerTokenSecret:       cfg.workerTokenSecret,
+		workerTokenTTL:          cfg.workerTokenTTL,
+		pollInterval:            cfg.pollInterval,
+		heartbeatInterval:       cfg.heartbeatInterval,
+		requestTimeout:          cfg.requestTimeout,
+		logDir:                  cfg.logDir,
+		stateFile:               cfg.stateFile,
+		logRetentionDays:        cfg.logRetentionDays,
+		logCleanupInterval:      cfg.logCleanupInterval,
+		reportMetrics:           cfg.reportMetrics,
 		commandAllowlistEnabled: cfg.commandAllowlistEnabled,
 		commandAllowlist:        cfg.commandAllowlist,
-		requireNonRoot:         cfg.requireNonRoot,
-		dryRun:                cfg.dryRun,
-		allowedWorkingDirs:    cfg.allowedWorkingDirs,
+		requireNonRoot:          cfg.requireNonRoot,
+		dryRun:                  cfg.dryRun,
+		allowedWorkingDirs:      cfg.allowedWorkingDirs,
+		registerInterval:        30 * time.Second,
 	}
 	artifactUploader, err := newArtifactUploader(cfg.artifactStorageBackend, cfg.artifactStorageLocation)
 	if err != nil {
@@ -79,7 +80,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := runner.register(ctx); err != nil {
+	if err := runner.ensureRegistered(ctx, "initial"); err != nil {
 		workerEvent("warn", "worker.register", map[string]any{
 			"worker_id": cfg.workerID,
 			"action":    "initial",
@@ -116,31 +117,31 @@ func main() {
 }
 
 type workerConfig struct {
-	controlURL        string
-	workerID          string
-	nonce             string
-	capabilities      []string
-	token             string
-	workerTokenSecret string
-	workerTokenTTL    time.Duration
-	pollInterval      time.Duration
-	heartbeatInterval time.Duration
-	requestTimeout    time.Duration
-	logDir            string
-	stateFile         string
-	logRetentionDays  int
-	logCleanupInterval time.Duration
-	reportMetrics     bool
+	controlURL              string
+	workerID                string
+	nonce                   string
+	capabilities            []string
+	token                   string
+	workerTokenSecret       string
+	workerTokenTTL          time.Duration
+	pollInterval            time.Duration
+	heartbeatInterval       time.Duration
+	requestTimeout          time.Duration
+	logDir                  string
+	stateFile               string
+	logRetentionDays        int
+	logCleanupInterval      time.Duration
+	reportMetrics           bool
 	commandAllowlistEnabled bool
 	commandAllowlist        []string
-	requireNonRoot         bool
-	dryRun                bool
-	allowedWorkingDirs    []string
-	artifactStorageBackend string
+	requireNonRoot          bool
+	dryRun                  bool
+	allowedWorkingDirs      []string
+	artifactStorageBackend  string
 	artifactStorageLocation string
-	tlsCA            string
-	tlsClientCert    string
-	tlsClientKey     string
+	tlsCA                   string
+	tlsClientCert           string
+	tlsClientKey            string
 }
 
 type workerConfigFile struct {
@@ -155,21 +156,21 @@ type workerConfigFile struct {
 	PollIntervalSeconds      *int64   `json:"poll_interval_seconds"`
 	HeartbeatIntervalSeconds *int64   `json:"heartbeat_interval_seconds"`
 	RequestTimeoutSeconds    *int64   `json:"request_timeout_seconds"`
-	LogDir                  *string  `json:"log_dir"`
-	StateFile               *string  `json:"state_file"`
-	LogRetentionDays        *int64   `json:"log_retention_days"`
-	LogCleanupIntervalSec   *int64   `json:"log_cleanup_interval_seconds"`
-	ReportMetrics           *bool    `json:"heartbeat_metrics"`
-	CommandAllowlist        *bool    `json:"command_allowlist"`
-	AllowedCommands         *string  `json:"allowed_commands"`
-	AllowedWorkingDirs      *string  `json:"allowed_working_dirs"`
-	ArtifactStorageBackend  *string  `json:"artifact_storage_backend"`
-	ArtifactStorageLocation *string  `json:"artifact_storage_location"`
-	RequireNonRoot          *bool    `json:"require_non_root"`
-	DryRun                  *bool    `json:"dry_run"`
-	TLSCA                   *string  `json:"tls_ca"`
-	TLSClientCert           *string  `json:"tls_client_cert"`
-	TLSClientKey            *string  `json:"tls_client_key"`
+	LogDir                   *string  `json:"log_dir"`
+	StateFile                *string  `json:"state_file"`
+	LogRetentionDays         *int64   `json:"log_retention_days"`
+	LogCleanupIntervalSec    *int64   `json:"log_cleanup_interval_seconds"`
+	ReportMetrics            *bool    `json:"heartbeat_metrics"`
+	CommandAllowlist         *bool    `json:"command_allowlist"`
+	AllowedCommands          *string  `json:"allowed_commands"`
+	AllowedWorkingDirs       *string  `json:"allowed_working_dirs"`
+	ArtifactStorageBackend   *string  `json:"artifact_storage_backend"`
+	ArtifactStorageLocation  *string  `json:"artifact_storage_location"`
+	RequireNonRoot           *bool    `json:"require_non_root"`
+	DryRun                   *bool    `json:"dry_run"`
+	TLSCA                    *string  `json:"tls_ca"`
+	TLSClientCert            *string  `json:"tls_client_cert"`
+	TLSClientKey             *string  `json:"tls_client_key"`
 }
 
 func parseWorkerConfig() workerConfig {
@@ -462,48 +463,50 @@ func normalizeAllowedWorkingDirs(raw string) []string {
 }
 
 type workerRunner struct {
-	controlURL        string
-	workerID          string
-	nonce             string
-	capabilities      []string
-	token             string
-	workerTokenSecret string
-	workerTokenTTL    time.Duration
-	pollInterval      time.Duration
-	heartbeatInterval time.Duration
-	requestTimeout    time.Duration
-	logDir            string
-	stateFile         string
-	logRetentionDays   int
-	logCleanupInterval time.Duration
-	currentJobID      atomic.Value
-	httpClient        *http.Client
-	stateMu           sync.Mutex
-	heartbeatSeq      int64
-	completionSeq     int64
-	reportMetrics     bool
+	controlURL              string
+	workerID                string
+	nonce                   string
+	capabilities            []string
+	token                   string
+	workerTokenSecret       string
+	workerTokenTTL          time.Duration
+	pollInterval            time.Duration
+	heartbeatInterval       time.Duration
+	requestTimeout          time.Duration
+	logDir                  string
+	stateFile               string
+	logRetentionDays        int
+	logCleanupInterval      time.Duration
+	currentJobID            atomic.Value
+	httpClient              *http.Client
+	stateMu                 sync.Mutex
+	heartbeatSeq            int64
+	completionSeq           int64
+	lastRegisterAt          int64
+	registerInterval        time.Duration
+	reportMetrics           bool
 	commandAllowlistEnabled bool
 	commandAllowlist        []string
-	requireNonRoot         bool
-	dryRun                bool
-	allowedWorkingDirs    []string
+	requireNonRoot          bool
+	dryRun                  bool
+	allowedWorkingDirs      []string
 	artifactStorageBackend  string
 	artifactStorageLocation string
-	artifactStorage       artifactUploader
+	artifactStorage         artifactUploader
 }
 
 type workerReconnectState struct {
-	CurrentJobID      string                     `json:"current_job_id"`
-	CurrentAssignmentID string                    `json:"current_assignment_id"`
-	CompletedJobs     []hdcf.ReconnectCompletedJob `json:"completed_jobs"`
-	HeartbeatSeq      int64                      `json:"heartbeat_seq"`
-	LastCompletionSeq int64                      `json:"last_completion_seq"`
+	CurrentJobID        string                       `json:"current_job_id"`
+	CurrentAssignmentID string                       `json:"current_assignment_id"`
+	CompletedJobs       []hdcf.ReconnectCompletedJob `json:"completed_jobs"`
+	HeartbeatSeq        int64                        `json:"heartbeat_seq"`
+	LastCompletionSeq   int64                        `json:"last_completion_seq"`
 }
 
 type artifactUploadState struct {
-	backend string
+	backend  string
 	location string
-	state string
+	state    string
 	errorMsg string
 }
 
@@ -641,10 +644,10 @@ func (r *workerRunner) loop(ctx context.Context) {
 		}
 
 		workerEvent("debug", "worker.loop_cycle", map[string]any{
-			"worker_id": r.workerID,
+			"worker_id":  r.workerID,
 			"backoff_ms": backoff.Milliseconds(),
 		})
-		if err := r.register(ctx); err != nil {
+		if err := r.ensureRegistered(ctx, "loop"); err != nil {
 			workerEvent("warn", "worker.register", map[string]any{
 				"worker_id": r.workerID,
 				"action":    "loop",
@@ -655,9 +658,10 @@ func (r *workerRunner) loop(ctx context.Context) {
 			continue
 		}
 		workerEvent("debug", "worker.register", map[string]any{
-			"worker_id": r.workerID,
-			"action":    "loop",
-			"status":    "ok",
+			"worker_id":        r.workerID,
+			"action":           "loop",
+			"status":           "ok",
+			"last_register_at": time.Unix(0, atomic.LoadInt64(&r.lastRegisterAt)).Format(time.RFC3339Nano),
 		})
 
 		job, err := r.nextJob(ctx)
@@ -715,9 +719,9 @@ func (r *workerRunner) loop(ctx context.Context) {
 		r.currentJobID.Store("")
 		if err := r.clearCurrentReconnectState(); err != nil {
 			workerEvent("warn", "worker.state_persist", map[string]any{
-				"worker_id": r.workerID,
+				"worker_id":      r.workerID,
 				"current_job_id": "",
-				"error":     err.Error(),
+				"error":          err.Error(),
 			})
 		}
 		backoff = r.pollInterval
@@ -735,7 +739,7 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 			workerEvent("debug", "worker.heartbeat_cycle", map[string]any{
 				"worker_id": r.workerID,
 			})
-			if err := r.register(ctx); err != nil {
+			if err := r.ensureRegistered(ctx, "heartbeat"); err != nil {
 				workerEvent("warn", "worker.register", map[string]any{
 					"worker_id": r.workerID,
 					"action":    "heartbeat",
@@ -752,7 +756,7 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 			workerEvent("info", "worker.heartbeat", map[string]any{
-				"worker_id":  r.workerID,
+				"worker_id":      r.workerID,
 				"current_job_id": current,
 			})
 			if err := r.flushPendingReconnectResults(ctx); err != nil {
@@ -773,10 +777,10 @@ func (r *workerRunner) heartbeatLoop(ctx context.Context) {
 func (r *workerRunner) logCleanupLoop(ctx context.Context) {
 	if r.logRetentionDays <= 0 || r.logCleanupInterval <= 0 {
 		workerEvent("info", "worker.log_cleanup", map[string]any{
-			"worker_id": r.workerID,
+			"worker_id":      r.workerID,
 			"retention_days": r.logRetentionDays,
-			"interval_sec":  int(r.logCleanupInterval.Seconds()),
-			"status":        "disabled",
+			"interval_sec":   int(r.logCleanupInterval.Seconds()),
+			"status":         "disabled",
 		})
 		return
 	}
@@ -809,8 +813,8 @@ func (r *workerRunner) reconnect(ctx context.Context) error {
 	r.heartbeatSeq = state.HeartbeatSeq
 	r.completionSeq = state.LastCompletionSeq
 	workerEvent("info", "worker.reconnect", map[string]any{
-		"worker_id":      r.workerID,
-		"scope":          "startup",
+		"worker_id":       r.workerID,
+		"scope":           "startup",
 		"has_current_job": strings.TrimSpace(state.CurrentJobID) != "",
 		"pending_replays": len(state.CompletedJobs),
 	})
@@ -984,6 +988,32 @@ func (r *workerRunner) register(ctx context.Context) error {
 	return retryWithBackoff(ctx, r.requestTimeout, func() error {
 		return r.postJSON(ctx, endpoint, payload)
 	}, 4)
+}
+
+func (r *workerRunner) ensureRegistered(ctx context.Context, scope string) error {
+	if r.registerInterval <= 0 {
+		return r.register(ctx)
+	}
+
+	last := atomic.LoadInt64(&r.lastRegisterAt)
+	if last > 0 {
+		lastRegister := time.Unix(0, last)
+		if time.Since(lastRegister) < r.registerInterval {
+			workerEvent("debug", "worker.register", map[string]any{
+				"worker_id":      r.workerID,
+				"action":         scope,
+				"status":         "throttled",
+				"throttle_until": lastRegister.Add(r.registerInterval).Format(time.RFC3339Nano),
+			})
+			return nil
+		}
+	}
+
+	if err := r.register(ctx); err != nil {
+		return err
+	}
+	atomic.StoreInt64(&r.lastRegisterAt, time.Now().UnixNano())
+	return nil
 }
 
 func (r *workerRunner) nextJob(ctx context.Context) (*hdcf.AssignedJob, error) {
@@ -1441,18 +1471,18 @@ func (r *workerRunner) executeJob(ctx context.Context, job *hdcf.AssignedJob) {
 			JobID:        job.JobID,
 			WorkerID:     r.workerID,
 			AssignmentID: job.AssignmentID,
-			ExitCode:    exitCode,
-			Error:       msg,
+			ExitCode:     exitCode,
+			Error:        msg,
 		}
 		reconnectEntry := hdcf.ReconnectCompletedJob{
-			JobID:        job.JobID,
+			JobID:         job.JobID,
 			AssignmentID:  job.AssignmentID,
 			CompletionSeq: completionSeq,
-			Status:       hdcf.StatusFailed,
-			ExitCode:     failReq.ExitCode,
-			StderrPath:   stderrTmpPath,
-			StdoutPath:   stdoutTmpPath,
-			Error:        msg,
+			Status:        hdcf.StatusFailed,
+			ExitCode:      failReq.ExitCode,
+			StderrPath:    stderrTmpPath,
+			StdoutPath:    stdoutTmpPath,
+			Error:         msg,
 		}
 		if err := r.enqueueCompletedReconnectResult(reconnectEntry); err != nil {
 			workerEvent("warn", "worker.job_reconnect_queue", map[string]any{
@@ -1552,42 +1582,42 @@ func (r *workerRunner) reportCompletedJob(ctx context.Context, job *hdcf.Assigne
 	}
 	completionSeq := r.nextCompletionSeq()
 	compReq := hdcf.CompleteRequest{
-		JobID:         job.JobID,
-		WorkerID:      r.workerID,
-		AssignmentID:  job.AssignmentID,
-		ExitCode:      exitCode,
-		ArtifactID:    artifactID,
-		StdoutPath:    stdoutPath,
-		StderrPath:    stderrPath,
-		StdoutTmpPath: stdoutTmpPath,
-		StderrTmpPath: stderrTmpPath,
-		StdoutSHA256:  stdoutSHA256,
-		StderrSHA256:  stderrSHA256,
-		ArtifactBackend: uploadState.backend,
-		ArtifactLocation: uploadState.location,
+		JobID:               job.JobID,
+		WorkerID:            r.workerID,
+		AssignmentID:        job.AssignmentID,
+		ExitCode:            exitCode,
+		ArtifactID:          artifactID,
+		StdoutPath:          stdoutPath,
+		StderrPath:          stderrPath,
+		StdoutTmpPath:       stdoutTmpPath,
+		StderrTmpPath:       stderrTmpPath,
+		StdoutSHA256:        stdoutSHA256,
+		StderrSHA256:        stderrSHA256,
+		ArtifactBackend:     uploadState.backend,
+		ArtifactLocation:    uploadState.location,
 		ArtifactUploadState: uploadState.state,
 		ArtifactUploadError: uploadState.errorMsg,
-		CompletionSeq:  completionSeq,
-		ResultSummary:  summary,
+		CompletionSeq:       completionSeq,
+		ResultSummary:       summary,
 	}
 	reconnectEntry := hdcf.ReconnectCompletedJob{
-		JobID:         job.JobID,
-		AssignmentID:   job.AssignmentID,
-		CompletionSeq: completionSeq,
-		Status:        hdcf.StatusCompleted,
-		ExitCode:      exitCode,
-		StdoutPath:    stdoutPath,
-		StderrPath:    stderrPath,
-		ArtifactID:    artifactID,
-		StdoutTmpPath: stdoutTmpPath,
-		StderrTmpPath: stderrTmpPath,
-		StdoutSHA256:  stdoutSHA256,
-		StderrSHA256:  stderrSHA256,
-		ArtifactBackend: uploadState.backend,
-		ArtifactLocation: uploadState.location,
+		JobID:               job.JobID,
+		AssignmentID:        job.AssignmentID,
+		CompletionSeq:       completionSeq,
+		Status:              hdcf.StatusCompleted,
+		ExitCode:            exitCode,
+		StdoutPath:          stdoutPath,
+		StderrPath:          stderrPath,
+		ArtifactID:          artifactID,
+		StdoutTmpPath:       stdoutTmpPath,
+		StderrTmpPath:       stderrTmpPath,
+		StdoutSHA256:        stdoutSHA256,
+		StderrSHA256:        stderrSHA256,
+		ArtifactBackend:     uploadState.backend,
+		ArtifactLocation:    uploadState.location,
 		ArtifactUploadState: uploadState.state,
 		ArtifactUploadError: uploadState.errorMsg,
-		ResultSummary:  summary,
+		ResultSummary:       summary,
 	}
 	workerEvent("info", "worker.job_execute", map[string]any{
 		"worker_id":     r.workerID,
@@ -1611,14 +1641,14 @@ func (r *workerRunner) reportCompletedJob(ctx context.Context, job *hdcf.Assigne
 		return r.reportComplete(ctx, compReq)
 	}, 8) == nil {
 		workerEvent("info", "worker.job_completed", map[string]any{
-			"worker_id":     r.workerID,
-			"job_id":        job.JobID,
-			"assignment_id": job.AssignmentID,
-			"artifact_id":   artifactID,
-			"duration_ms":   duration,
-			"stdout_path":   stdoutPath,
-			"stderr_path":   stderrPath,
-			"exit_code":     exitCode,
+			"worker_id":      r.workerID,
+			"job_id":         job.JobID,
+			"assignment_id":  job.AssignmentID,
+			"artifact_id":    artifactID,
+			"duration_ms":    duration,
+			"stdout_path":    stdoutPath,
+			"stderr_path":    stderrPath,
+			"exit_code":      exitCode,
 			"result_summary": summary,
 		})
 		if err := r.removeCompletedReconnectResult(job.JobID, job.AssignmentID); err != nil {
@@ -1837,7 +1867,7 @@ func (r *workerRunner) flushPendingReconnectResults(ctx context.Context) error {
 				"worker_id":       r.workerID,
 				"result":          "pending_replays_rejected",
 				"action_count":    len(resp.Actions),
-				"remaining_count":  len(state.CompletedJobs),
+				"remaining_count": len(state.CompletedJobs),
 			})
 			return nil
 		}
@@ -1859,19 +1889,19 @@ func (r *workerRunner) handleJobFailure(ctx context.Context, job *hdcf.AssignedJ
 	})
 	completionSeq := r.nextCompletionSeq()
 	failReq := hdcf.FailRequest{
-		JobID:       job.JobID,
-		WorkerID:    r.workerID,
+		JobID:        job.JobID,
+		WorkerID:     r.workerID,
 		AssignmentID: job.AssignmentID,
-		ExitCode:    -1,
-		Error:       err.Error(),
+		ExitCode:     -1,
+		Error:        err.Error(),
 	}
 	reconnectEntry := hdcf.ReconnectCompletedJob{
-		JobID:       failReq.JobID,
-		AssignmentID: failReq.AssignmentID,
+		JobID:         failReq.JobID,
+		AssignmentID:  failReq.AssignmentID,
 		CompletionSeq: completionSeq,
-		Status:      hdcf.StatusFailed,
-		ExitCode:    failReq.ExitCode,
-		Error:       failReq.Error,
+		Status:        hdcf.StatusFailed,
+		ExitCode:      failReq.ExitCode,
+		Error:         failReq.Error,
 	}
 	if queueErr := r.enqueueCompletedReconnectResult(reconnectEntry); queueErr != nil {
 		workerEvent("warn", "worker.job_reconnect_queue", map[string]any{
@@ -1950,10 +1980,10 @@ func (r *workerRunner) cleanupLogArtifacts() error {
 	}
 	if deleted > 0 || failed > 0 {
 		workerEvent("info", "worker.log_cleanup", map[string]any{
-			"worker_id":      r.workerID,
-			"retention_days": r.logRetentionDays,
-			"deleted":        deleted,
-			"failed":         failed,
+			"worker_id":        r.workerID,
+			"retention_days":   r.logRetentionDays,
+			"deleted":          deleted,
+			"failed":           failed,
 			"candidate_cutoff": cutoff,
 		})
 	}
@@ -2021,16 +2051,16 @@ func readLimitedBody(r io.Reader) string {
 }
 
 const (
-	authHeader    = "X-API-Token"
+	authHeader     = "X-API-Token"
 	auditComponent = "worker_daemon"
 )
 
 func workerEvent(level, event string, fields map[string]any) {
 	payload := map[string]any{
-		"ts":         time.Now().Format(time.RFC3339Nano),
-		"component":  auditComponent,
-		"level":      level,
-		"event":      event,
+		"ts":        time.Now().Format(time.RFC3339Nano),
+		"component": auditComponent,
+		"level":     level,
+		"event":     event,
 	}
 	for k, v := range fields {
 		payload[k] = v
