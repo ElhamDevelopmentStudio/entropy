@@ -175,8 +175,8 @@ Progress:
 - Added `internal/store/store_test.go` with recovery-focused unit tests for completion idempotency and terminal-noop behavior.
 - Existing `scripts/reliability-scenarios.sh` remains the operational recovery script entrypoint; next step is to add a dedicated automated `tests/` harness and scripted Scenario A-D wrappers.
 
-11. `[ ]` P5-11 — Observability and alerting hooks
-Current status: logs + events only
+11. `[~]` P5-11 — Observability and alerting hooks
+Current status: metrics endpoint implemented; webhook/notification hooks pending.
 Target: control plane + worker
 Implementation tasks:
 - Export metrics endpoint (Prometheus-style or JSON) with:
@@ -187,6 +187,10 @@ Implementation tasks:
 - Add optional webhook/notification hook on hard events (`offlined worker`, `retry exhaustion`).
 Acceptance criteria:
 - SRE visibility supports early warnings.
+Progress:
+- Added `/metrics` admin endpoint and `MetricsSnapshot` response payload (`GET /metrics`).
+- Added control-plane aggregation for queue depth by state, worker totals, retry/loss counts, completion/failure rates, and completion lag.
+- Optional alert/webhook hooks still to add for hard events.
 
 12. `[ ]` P5-12 — Multi-worker operational readiness
 Current status: single-worker assumptions still present in behavior

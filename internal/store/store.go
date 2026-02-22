@@ -762,6 +762,125 @@ func (s *Store) ListJobs(ctx context.Context, statusFilter, workerIDFilter strin
 	return result, nil
 }
 
+func (s *Store) GetMetrics(ctx context.Context) (hdcf.MetricsSnapshot, error) {
+	now := time.Now().Unix()
+	snapshot := hdcf.MetricsSnapshot{
+		GeneratedAt:        now,
+		QueueDepthByStatus: map[string]int64{},
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT status, COUNT(1)
+		   FROM jobs
+		   GROUP BY status`,
+	)
+	if err != nil {
+		return snapshot, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return snapshot, err
+		}
+		snapshot.QueueDepthByStatus[strings.TrimSpace(status)] = count
+	}
+	if err := rows.Err(); err != nil {
+		return snapshot, err
+	}
+	for _, status := range []string{
+		hdcf.StatusPending,
+		hdcf.StatusAssigned,
+		hdcf.StatusRunning,
+		hdcf.StatusCompleted,
+		hdcf.StatusFailed,
+		hdcf.StatusLost,
+		hdcf.StatusRetrying,
+		hdcf.StatusAborted,
+	} {
+		if _, ok := snapshot.QueueDepthByStatus[strings.TrimSpace(status)]; !ok {
+			snapshot.QueueDepthByStatus[strings.TrimSpace(status)] = 0
+		}
+	}
+	snapshot.RetryingJobs = snapshot.QueueDepthByStatus[hdcf.StatusRetrying]
+	snapshot.LostJobs = snapshot.QueueDepthByStatus[hdcf.StatusLost]
+
+	workerRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT status, COUNT(1)
+		   FROM workers
+		   GROUP BY status`,
+	)
+	if err != nil {
+		return snapshot, err
+	}
+	defer workerRows.Close()
+	for workerRows.Next() {
+		var status string
+		var count int64
+		if err := workerRows.Scan(&status, &count); err != nil {
+			return snapshot, err
+		}
+		switch strings.TrimSpace(strings.ToUpper(status)) {
+		case "ONLINE":
+			snapshot.WorkersOnline = count
+		case "OFFLINE":
+			snapshot.WorkersOffline = count
+		}
+		snapshot.WorkersTotal += count
+	}
+	if err := workerRows.Err(); err != nil {
+		return snapshot, err
+	}
+
+	jobEventRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT event, COUNT(1)
+		   FROM audit_events
+		  WHERE event IN ('job.complete', 'job.fail')
+		    AND ts >= ?
+		  GROUP BY event`,
+		now-300,
+	)
+	if err != nil {
+		return snapshot, err
+	}
+	defer jobEventRows.Close()
+	for jobEventRows.Next() {
+		var eventName string
+		var count int64
+		if err := jobEventRows.Scan(&eventName, &count); err != nil {
+			return snapshot, err
+		}
+		switch strings.TrimSpace(eventName) {
+		case "job.complete":
+			snapshot.CompletedLast5m = count
+		case "job.fail":
+			snapshot.FailedLast5m = count
+		}
+	}
+	if err := jobEventRows.Err(); err != nil {
+		return snapshot, err
+	}
+
+	var avgCompletion sql.NullFloat64
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT AVG(updated_at - created_at)
+		   FROM jobs
+		  WHERE status = ?`,
+		hdcf.StatusCompleted,
+	).Scan(&avgCompletion); err != nil {
+		return snapshot, err
+	}
+	if avgCompletion.Valid {
+		snapshot.AvgCompletionSec = avgCompletion.Float64
+	}
+	return snapshot, nil
+}
+
 func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, error) {
 	now := time.Now().Unix()
 	id := strings.TrimSpace(jobID)

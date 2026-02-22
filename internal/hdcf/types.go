@@ -268,6 +268,19 @@ type WorkerReconnectResponse struct {
 	Actions []ReconnectAction `json:"actions"`
 }
 
+type MetricsSnapshot struct {
+	GeneratedAt        int64           `json:"generated_at"`
+	QueueDepthByStatus map[string]int64 `json:"queue_depth_by_status"`
+	WorkersTotal       int64           `json:"workers_total"`
+	WorkersOnline      int64           `json:"workers_online"`
+	WorkersOffline     int64           `json:"workers_offline"`
+	RetryingJobs       int64           `json:"retrying_jobs"`
+	LostJobs           int64           `json:"lost_jobs"`
+	CompletedLast5m    int64           `json:"completed_last_5m"`
+	FailedLast5m       int64           `json:"failed_last_5m"`
+	AvgCompletionSec   float64         `json:"avg_completion_seconds"`
+}
+
 type AuditEvent struct {
 	ID        int64                  `json:"id"`
 	Timestamp int64                  `json:"ts"`

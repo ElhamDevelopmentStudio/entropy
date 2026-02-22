@@ -218,6 +218,7 @@ Advanced scheduling fields are accepted directly by the API as part of `POST /jo
 - `GET /workers`
 - `POST /complete`
 - `POST /fail`
+- `GET /metrics` (admin)
 - `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `since_id`, `limit`)  
   `since_id` returns only events with `id > since_id` for incremental polling.
 - `POST /reconnect` supports optional `current_job_id` and completed-job replay payload, and can now be manually invoked via `hdcfctl replay`.
@@ -237,6 +238,12 @@ Read/observability behavior:
 - `GET /workers` returns worker rows with heartbeat age in seconds and optional latest `heartbeat_metrics`.
 - `GET /events` returns durable control-plane structured events (filtered by component/event/worker/job, optional `since_id` cursor, with a default descending order and configurable limit).  
   Use this as the primary recovery audit trail before touching the database directly.
+- `GET /metrics` returns aggregated JSON metrics snapshot for observability:
+  - `queue_depth_by_status`
+  - worker totals (`workers_total`, `workers_online`, `workers_offline`)
+  - `retrying_jobs` and `lost_jobs`
+  - completion/failure counters over 5 minutes (`completed_last_5m`, `failed_last_5m`)
+  - `avg_completion_seconds` across completed jobs.
 
 Abort behavior:
 

@@ -76,6 +76,7 @@ func main() {
 	mux.HandleFunc("/ui/", dashboardUI())
 	mux.HandleFunc("/jobs", withAdminAuth(&cfg, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAdminAuth(&cfg, getJobHandler(s)))
+	mux.HandleFunc("/metrics", withAdminAuth(&cfg, metricsHandler(s)))
 	mux.HandleFunc("/register", withWorkerAuth(&cfg, registerWorker(&cfg, s)))
 	mux.HandleFunc("/next-job", withWorkerAuth(&cfg, nextJob(&cfg, s)))
 	mux.HandleFunc("/ack", withWorkerAuth(&cfg, ackJob(&cfg, s)))
@@ -899,6 +900,42 @@ func jobsHandler(s *store.Store) http.HandlerFunc {
 			})
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		}
+	}
+}
+
+func metricsHandler(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		requestID := requestIDFromHTTP(r)
+		ctx := store.WithRequestID(r.Context(), requestID)
+		if r.Method != http.MethodGet {
+			auditEvent("warn", "control.metrics", requestID, map[string]any{
+				"status_code": http.StatusMethodNotAllowed,
+				"error":       "method not allowed",
+			})
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		metrics, err := s.GetMetrics(ctx)
+		if err != nil {
+			auditEvent("warn", "control.metrics", requestID, map[string]any{
+				"status_code": http.StatusInternalServerError,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		auditEvent("info", "control.metrics", requestID, map[string]any{
+			"status_code":          http.StatusOK,
+			"workers_total":        metrics.WorkersTotal,
+			"workers_online":       metrics.WorkersOnline,
+			"workers_offline":      metrics.WorkersOffline,
+			"retrying_jobs":        metrics.RetryingJobs,
+			"lost_jobs":            metrics.LostJobs,
+			"completed_last_5m":    metrics.CompletedLast5m,
+			"failed_last_5m":       metrics.FailedLast5m,
+			"avg_completion_sec":    metrics.AvgCompletionSec,
+		})
+		writeJSON(w, http.StatusOK, metrics)
 	}
 }
 
