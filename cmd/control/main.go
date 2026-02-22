@@ -2,6 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -59,25 +65,48 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ui", dashboardUI())
 	mux.HandleFunc("/ui/", dashboardUI())
-	mux.HandleFunc("/jobs", withAuth(cfg.apiToken, jobsHandler(s)))
-	mux.HandleFunc("/jobs/", withAuth(cfg.apiToken, getJobHandler(s)))
-	mux.HandleFunc("/register", withAuth(cfg.apiToken, registerWorker(s)))
-	mux.HandleFunc("/next-job", withAuth(cfg.apiToken, nextJob(s)))
-	mux.HandleFunc("/ack", withAuth(cfg.apiToken, ackJob(s)))
-	mux.HandleFunc("/heartbeat", withAuth(cfg.apiToken, heartbeat(s)))
-	mux.HandleFunc("/reconnect", withAuth(cfg.apiToken, reconnectWorker(s)))
-	mux.HandleFunc("/abort", withAuth(cfg.apiToken, abortJob(s)))
-	mux.HandleFunc("/workers", withAuth(cfg.apiToken, listWorkers(s)))
-	mux.HandleFunc("/events", withAuth(cfg.apiToken, listEvents(s)))
-	mux.HandleFunc("/complete", withAuth(cfg.apiToken, completeJob(s)))
-	mux.HandleFunc("/fail", withAuth(cfg.apiToken, failJob(s)))
+	mux.HandleFunc("/jobs", withAdminAuth(&cfg, jobsHandler(s)))
+	mux.HandleFunc("/jobs/", withAdminAuth(&cfg, getJobHandler(s)))
+	mux.HandleFunc("/register", withWorkerAuth(&cfg, registerWorker(&cfg, s)))
+	mux.HandleFunc("/next-job", withWorkerAuth(&cfg, nextJob(&cfg, s)))
+	mux.HandleFunc("/ack", withWorkerAuth(&cfg, ackJob(&cfg, s)))
+	mux.HandleFunc("/heartbeat", withWorkerAuth(&cfg, heartbeat(&cfg, s)))
+	mux.HandleFunc("/reconnect", withWorkerAuth(&cfg, reconnectWorker(&cfg, s)))
+	mux.HandleFunc("/abort", withAdminAuth(&cfg, abortJob(s)))
+	mux.HandleFunc("/workers", withAdminAuth(&cfg, listWorkers(s)))
+	mux.HandleFunc("/events", withAdminAuth(&cfg, listEvents(s)))
+	mux.HandleFunc("/complete", withWorkerAuth(&cfg, completeJob(&cfg, s)))
+	mux.HandleFunc("/fail", withWorkerAuth(&cfg, failJob(&cfg, s)))
 
 	auditEvent("info", "control.listen", "", map[string]any{
 		"addr":  cfg.addr,
 		"db":    cfg.dbPath,
 		"state": "starting",
+		"tls":   cfg.tlsCert != "" && cfg.tlsKey != "",
 	})
-	if err := http.ListenAndServe(cfg.addr, mux); err != nil {
+	server := &http.Server{
+		Addr:    cfg.addr,
+		Handler: mux,
+	}
+	if cfg.tlsCert != "" || cfg.tlsKey != "" {
+		if cfg.tlsCert == "" || cfg.tlsKey == "" {
+			log.Fatalf("both -tls-cert and -tls-key are required for TLS mode")
+		}
+		tlsConfig, err := buildControlTLSConfig(cfg)
+		if err != nil {
+			log.Fatalf("failed to configure TLS: %v", err)
+		}
+		server.TLSConfig = tlsConfig
+		auditEvent("info", "control.listen", "", map[string]any{
+			"addr":     cfg.addr,
+		"protocol": "https",
+		})
+		if err := server.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey); err != nil {
+			log.Fatalf("https server exited: %v", err)
+		}
+		return
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("http server exited: %v", err)
 	}
 }
@@ -551,7 +580,16 @@ func dashboardUI() http.HandlerFunc {
 type controlConfig struct {
 	addr               string
 	dbPath             string
-	apiToken           string
+	adminToken         string
+	adminTokenPrev     string
+	workerToken        string
+	workerTokenPrev    string
+	workerTokenSecret  string
+	workerTokenTTL     time.Duration
+	tlsCert            string
+	tlsKey             string
+	tlsClientCA        string
+	tlsRequireClientCert bool
 	heartbeatTimeout   time.Duration
 	reconcileInterval  time.Duration
 	cleanupInterval    time.Duration
@@ -562,9 +600,21 @@ type controlConfig struct {
 
 func parseConfig() controlConfig {
 	var cfg controlConfig
+	var legacyToken string
 	flag.StringVar(&cfg.addr, "addr", getenvDefault("HDCF_ADDR", ":8080"), "control plane listen addr")
 	flag.StringVar(&cfg.dbPath, "db", getenvDefault("HDCF_DB_PATH", "jobs.db"), "sqlite db path")
-	flag.StringVar(&cfg.apiToken, "token", getenvDefault("HDCF_API_TOKEN", "dev-token"), "api token")
+	flag.StringVar(&legacyToken, "token", getenvDefault("HDCF_API_TOKEN", "dev-token"), "legacy shared token for admin and worker endpoints")
+	flag.StringVar(&cfg.adminToken, "admin-token", "", "admin token (overrides -token)")
+	flag.StringVar(&cfg.adminTokenPrev, "admin-token-prev", getenvDefault("HDCF_ADMIN_TOKEN_PREV", ""), "previous admin token (for rotation)")
+	flag.StringVar(&cfg.workerToken, "worker-token", "", "worker token (overrides -token)")
+	flag.StringVar(&cfg.workerTokenPrev, "worker-token-prev", getenvDefault("HDCF_WORKER_TOKEN_PREV", ""), "previous worker token (for rotation)")
+	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", getenvDefault("HDCF_WORKER_TOKEN_SECRET", ""), "secret for short-lived signed worker tokens")
+	var workerTokenTTLSeconds int64
+	flag.Int64Var(&workerTokenTTLSeconds, "worker-token-ttl-seconds", getenvInt("HDCF_WORKER_TOKEN_TTL_SECONDS", 3600), "signed worker token TTL in seconds")
+	flag.StringVar(&cfg.tlsCert, "tls-cert", getenvDefault("HDCF_TLS_CERT", ""), "TLS certificate PEM for https control API")
+	flag.StringVar(&cfg.tlsKey, "tls-key", getenvDefault("HDCF_TLS_KEY", ""), "TLS private key PEM for https control API")
+	flag.StringVar(&cfg.tlsClientCA, "tls-client-ca", getenvDefault("HDCF_TLS_CLIENT_CA", ""), "CA certificate PEM to verify worker client certs when mTLS is enabled")
+	flag.BoolVar(&cfg.tlsRequireClientCert, "tls-require-client-cert", false, "require and verify client certificates")
 	var heartbeatSec int64
 	var reconcileSec int64
 	var cleanupIntervalSec int64
@@ -578,12 +628,25 @@ func parseConfig() controlConfig {
 	flag.Int64Var(&artifactsRetentionDays, "artifacts-retention-days", getenvInt("HDCF_ARTIFACTS_RETENTION_DAYS", 14), "days to retain terminal artifact/log files (cleanup does not block scheduling)")
 	flag.Int64Var(&eventsRetentionDays, "events-retention-days", getenvInt("HDCF_EVENTS_RETENTION_DAYS", 30), "days to retain audit events")
 	flag.Parse()
+	if strings.TrimSpace(cfg.adminToken) == "" {
+		cfg.adminToken = legacyToken
+	}
+	if strings.TrimSpace(cfg.workerToken) == "" {
+		cfg.workerToken = legacyToken
+	}
+	if workerTokenTTLSeconds < 1 {
+		workerTokenTTLSeconds = 1
+	}
 	cfg.heartbeatTimeout = time.Duration(heartbeatSec) * time.Second
 	cfg.reconcileInterval = time.Duration(reconcileSec) * time.Second
 	cfg.cleanupInterval = time.Duration(cleanupIntervalSec) * time.Second
 	cfg.jobsRetentionCompletedDays = int(jobsRetentionCompletedDays)
 	cfg.artifactsRetentionDays = int(artifactsRetentionDays)
 	cfg.eventsRetentionDays = int(eventsRetentionDays)
+	cfg.workerTokenTTL = time.Duration(workerTokenTTLSeconds) * time.Second
+	if cfg.tlsRequireClientCert && strings.TrimSpace(cfg.tlsClientCA) == "" {
+		log.Fatalf("tls-client-ca is required when tls-require-client-cert is enabled")
+	}
 	return cfg
 }
 
@@ -606,14 +669,133 @@ func getenvInt(name string, fallback int64) int64 {
 	return parsed
 }
 
-func withAuth(token string, next http.HandlerFunc) http.HandlerFunc {
+func withAdminAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.TrimSpace(token) != "" && r.Header.Get(authHeaderName) != token {
+		if err := cfg.authorizeAdminRequest(strings.TrimSpace(r.Header.Get(authHeaderName))); err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		next(w, r)
 	}
+}
+
+func withWorkerAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), ""); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (cfg *controlConfig) authorizeAdminRequest(token string) error {
+	if cfg.adminToken == "" {
+		return nil
+	}
+	if tokenMatches(token, cfg.adminToken) {
+		return nil
+	}
+	if cfg.adminTokenPrev != "" && tokenMatches(token, cfg.adminTokenPrev) {
+		return nil
+	}
+	return fmt.Errorf("invalid admin token")
+}
+
+func (cfg *controlConfig) authorizeWorkerRequest(token string, workerID string) error {
+	if cfg.workerToken == "" {
+		cfg.workerToken = cfg.adminToken
+	}
+	if tokenMatches(token, cfg.workerToken) {
+		return nil
+	}
+	if cfg.workerTokenPrev != "" && tokenMatches(token, cfg.workerTokenPrev) {
+		return nil
+	}
+	if cfg.workerTokenSecret != "" {
+		return cfg.validateWorkerSignedToken(token, workerID)
+	}
+	return fmt.Errorf("invalid worker token")
+}
+
+func (cfg *controlConfig) validateWorkerSignedToken(token, workerID string) error {
+	payload, sig, err := parseWorkerSignedToken(token)
+	if err != nil {
+		return err
+	}
+	if tokenMatches(sig, generateWorkerSignedTokenSig(cfg.workerTokenSecret, payload)) {
+		parts := strings.SplitN(payload, "|", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid worker token payload")
+		}
+		expiresUnix, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid worker token expiry")
+		}
+		if time.Now().Unix() > expiresUnix {
+			return fmt.Errorf("expired worker token")
+		}
+		if workerID != "" && strings.TrimSpace(parts[0]) != workerID {
+			return fmt.Errorf("worker token mismatch")
+		}
+		return nil
+	}
+	return fmt.Errorf("invalid worker token signature")
+}
+
+func parseWorkerSignedToken(token string) (string, string, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		return "", "", fmt.Errorf("invalid worker token format")
+	}
+	payloadRaw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid worker token payload")
+	}
+	return strings.TrimSpace(string(payloadRaw)), strings.TrimSpace(parts[2]), nil
+}
+
+func generateWorkerSignedTokenSig(secret string, payload string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func buildControlTLSConfig(cfg controlConfig) (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if cfg.tlsClientCA == "" {
+		if cfg.tlsRequireClientCert {
+			return nil, fmt.Errorf("tls-client-ca required when tls-require-client-cert is enabled")
+		}
+		return tlsConfig, nil
+	}
+	caPem, err := os.ReadFile(cfg.tlsClientCA)
+	if err != nil {
+		return nil, fmt.Errorf("read tls client ca: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPem) {
+		return nil, fmt.Errorf("failed to parse tls client ca")
+	}
+	tlsConfig.ClientCAs = pool
+	if cfg.tlsRequireClientCert {
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	} else {
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+	return tlsConfig, nil
+}
+
+func tokenMatches(provided, expected string) bool {
+	if strings.TrimSpace(expected) == "" || strings.TrimSpace(provided) == "" {
+		return false
+	}
+	if len(provided) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
 func createJob(s *store.Store) http.HandlerFunc {
@@ -792,6 +974,19 @@ func listEvents(s *store.Store) http.HandlerFunc {
 		eventName := strings.TrimSpace(query.Get("event"))
 		workerID := strings.TrimSpace(query.Get("worker_id"))
 		jobID := strings.TrimSpace(query.Get("job_id"))
+		sinceID := int64(0)
+		if raw := strings.TrimSpace(query.Get("since_id")); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value < 1 {
+				auditEvent("warn", "control.events_list", requestID, map[string]any{
+					"status_code": http.StatusBadRequest,
+					"error":       "since_id must be a positive integer",
+				})
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "since_id must be a positive integer"})
+				return
+			}
+			sinceID = value
+		}
 
 		limit := 200
 		if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
@@ -810,7 +1005,7 @@ func listEvents(s *store.Store) http.HandlerFunc {
 			limit = 5000
 		}
 
-		events, err := s.ListAuditEvents(ctx, component, eventName, workerID, jobID, limit)
+		events, err := s.ListAuditEvents(ctx, component, eventName, workerID, jobID, sinceID, limit)
 		if err != nil {
 			auditEvent("warn", "control.events_list", requestID, map[string]any{
 				"status_code": http.StatusInternalServerError,
@@ -836,7 +1031,7 @@ func listEvents(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func registerWorker(s *store.Store) http.HandlerFunc {
+func registerWorker(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -866,6 +1061,15 @@ func registerWorker(s *store.Store) http.HandlerFunc {
 			return
 		}
 		req.WorkerID = workerID
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.worker_register", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
 		if err := s.RegisterWorker(ctx, req); err != nil {
 			auditEvent("warn", "control.worker_register", requestID, map[string]any{
 				"status_code": http.StatusConflict,
@@ -883,7 +1087,7 @@ func registerWorker(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func nextJob(s *store.Store) http.HandlerFunc {
+func nextJob(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -902,6 +1106,15 @@ func nextJob(s *store.Store) http.HandlerFunc {
 				"error":       "worker_id required",
 			})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
+			return
+		}
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.next_job", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		if err := requireRegisteredWorker(ctx, s, workerID); err != nil {
@@ -945,7 +1158,7 @@ func nextJob(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func ackJob(s *store.Store) http.HandlerFunc {
+func ackJob(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -972,6 +1185,16 @@ func ackJob(s *store.Store) http.HandlerFunc {
 				"error":       "job_id, worker_id, and assignment_id required",
 			})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
+			return
+		}
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.ack", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"job_id":      strings.TrimSpace(req.JobID),
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		if err := requireRegisteredWorker(ctx, s, workerID); err != nil {
@@ -1007,7 +1230,7 @@ func ackJob(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func heartbeat(s *store.Store) http.HandlerFunc {
+func heartbeat(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -1034,6 +1257,15 @@ func heartbeat(s *store.Store) http.HandlerFunc {
 				"error":       "worker_id required",
 			})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
+			return
+		}
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.heartbeat", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		if err := requireRegisteredWorker(ctx, s, workerID); err != nil {
@@ -1066,7 +1298,7 @@ func heartbeat(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func reconnectWorker(s *store.Store) http.HandlerFunc {
+func reconnectWorker(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -1093,6 +1325,15 @@ func reconnectWorker(s *store.Store) http.HandlerFunc {
 				"error":       "worker_id required",
 			})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_id required"})
+			return
+		}
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.reconnect", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		if err := requireRegisteredWorker(ctx, s, workerID); err != nil {
@@ -1239,7 +1480,7 @@ func abortJob(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func completeJob(s *store.Store) http.HandlerFunc {
+func completeJob(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -1266,6 +1507,16 @@ func completeJob(s *store.Store) http.HandlerFunc {
 				"error":       "job_id, worker_id, and assignment_id required",
 			})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
+			return
+		}
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.complete", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"job_id":      strings.TrimSpace(req.JobID),
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		if err := requireRegisteredWorker(ctx, s, workerID); err != nil {
@@ -1303,7 +1554,7 @@ func completeJob(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func failJob(s *store.Store) http.HandlerFunc {
+func failJob(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFromHTTP(r)
 		ctx := store.WithRequestID(r.Context(), requestID)
@@ -1330,6 +1581,16 @@ func failJob(s *store.Store) http.HandlerFunc {
 				"error":       "job_id, worker_id, and assignment_id required",
 			})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
+			return
+		}
+		if err := cfg.authorizeWorkerRequest(strings.TrimSpace(r.Header.Get(authHeaderName)), workerID); err != nil {
+			auditEvent("warn", "control.fail", requestID, map[string]any{
+				"status_code": http.StatusUnauthorized,
+				"job_id":      strings.TrimSpace(req.JobID),
+				"worker_id":   workerID,
+				"error":       err.Error(),
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		if err := requireRegisteredWorker(ctx, s, workerID); err != nil {

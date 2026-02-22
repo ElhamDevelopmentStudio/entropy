@@ -127,6 +127,9 @@ func (s *Store) initSchema(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts);
 	CREATE INDEX IF NOT EXISTS idx_audit_events_component_event ON audit_events(component, event);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_component ON audit_events(component);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_event ON audit_events(event);
+	CREATE INDEX IF NOT EXISTS idx_audit_events_ts_id ON audit_events(ts, id);
 	CREATE INDEX IF NOT EXISTS idx_audit_events_job ON audit_events(job_id);
 	CREATE INDEX IF NOT EXISTS idx_audit_events_worker ON audit_events(worker_id);
 	`
@@ -140,13 +143,16 @@ func (s *Store) initSchema(ctx context.Context) error {
 	if err := s.ensureAuditEventColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureAuditEventIndexes(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureJobIndexes(ctx); err != nil {
 		return err
 	}
 	return s.ensureWorkerColumns(ctx)
 }
 
-func (s *store) ensureAuditEventColumns(ctx context.Context) error {
+func (s *Store) ensureAuditEventColumns(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(audit_events)")
 	if err != nil {
 		return err
@@ -184,6 +190,21 @@ func (s *store) ensureAuditEventColumns(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureAuditEventIndexes(ctx context.Context) error {
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_component_event_ts_id ON audit_events(component, event, ts, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_event_ts_id ON audit_events(event, ts, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_worker_ts_id ON audit_events(worker_id, ts, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_job_ts_id ON audit_events(job_id, ts, id)`,
+	}
+	for _, ddl := range indexes {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 			return err
 		}
 	}
@@ -753,7 +774,7 @@ func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
 	return result, nil
 }
 
-func (s *Store) ListAuditEvents(ctx context.Context, component, eventName, workerID, jobID string, limit int) ([]hdcf.AuditEvent, error) {
+func (s *Store) ListAuditEvents(ctx context.Context, component, eventName, workerID, jobID string, sinceID int64, limit int) ([]hdcf.AuditEvent, error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -787,6 +808,10 @@ func (s *Store) ListAuditEvents(ctx context.Context, component, eventName, worke
 	if jobID != "" {
 		filters = append(filters, "job_id = ?")
 		args = append(args, jobID)
+	}
+	if sinceID > 0 {
+		filters = append(filters, "id > ?")
+		args = append(args, sinceID)
 	}
 	if len(filters) > 0 {
 		query += " WHERE " + strings.Join(filters, " AND ")

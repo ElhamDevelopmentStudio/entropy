@@ -55,8 +55,8 @@ Progress:
 - Added worker-side local artifact log cleanup policy with retention interval and skip for currently running job.
 - Added audit logging around cleanup passes and outcomes.
 
-3. `[ ]` P5-03 — Full transport security (TLS) and stronger auth
-Current status: static `X-API-Token` only
+3. `[x]` P5-03 — Full transport security (TLS) and stronger auth
+Current status: implemented scoped admin/worker auth, signed tokens, and TLS flags
 Target: `cmd/control` + `cmd/worker`
 Implementation tasks:
 - Add HTTPS listen mode with cert/key config flags (or mTLS optional mode).
@@ -68,9 +68,21 @@ Implementation tasks:
 Acceptance criteria:
 - Insecure mode remains possible for local lab use, but secure mode prevents traffic sniffing and token replay.
 - Token and TLS credentials are never logged.
+Progress:
+- Added role-scoped auth:
+  - admin token + optional previous token via `-admin-token` / `-admin-token-prev`
+  - worker token + optional previous token via `-worker-token` / `-worker-token-prev`
+  - optional signed per-worker tokens via `-worker-token-secret` and `-worker-token-ttl-seconds`
+- Control-plane HTTPS support:
+  - `-tls-cert`, `-tls-key`
+  - optional mTLS verification via `-tls-client-ca` and `-tls-require-client-cert`
+- Worker TLS client support:
+  - `-tls-ca` for control-plane CA trust
+  - optional `-tls-client-cert` + `-tls-client-key` for mTLS
+- Worker now emits signed tokens when secret mode is configured.
 
-4. `[ ]` P5-04 — Dashboard-ready audit + event indexing
-Current status: event endpoint exists but not indexed for UI search speed
+4. `[x]` P5-04 — Dashboard-ready audit + event indexing
+Current status: complete
 Target: `internal/store/store.go`, control read paths
 Implementation tasks:
 - Add DB indexes on `audit_events` for frequent filters (`event`, `worker_id`, `job_id`, `component`).
@@ -78,6 +90,9 @@ Implementation tasks:
 - Add UI-friendly summaries (`error_rate`, top transitions).
 Acceptance criteria:
 - Dashboard and alerting can query large event history without scan overhead.
+Progress:
+- Added incremental event cursor support via `GET /events?since_id`.
+- Added audit event indexes for `component`, `event`, and `ts/id` scan patterns with schema migration-safe creation.
 
 5. `[ ]` P5-05 — Worker-side security hardening for command execution
 Current status: arbitrary shell command string execution

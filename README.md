@@ -13,38 +13,56 @@ This repository contains an implementation of the feasibility plan from `mvp.md`
 ### 1) Start control plane on Mac
 
 ```bash
-go run ./cmd/control -addr :8080 -db ./jobs.db -token dev-token
+go run ./cmd/control -addr :8080 -db ./jobs.db -admin-token dev-token -worker-token dev-token
 ```
 
 Environment variables available:
 
 - `HDCF_ADDR` (default `:8080`)
 - `HDCF_DB_PATH` (default `jobs.db`)
-- `HDCF_API_TOKEN` (default `dev-token`)
+- `HDCF_API_TOKEN` (legacy shared token, default `dev-token`)
+- `HDCF_ADMIN_TOKEN` (admin token; overrides legacy token)
+- `HDCF_ADMIN_TOKEN_PREV` (previous admin token)
+- `HDCF_WORKER_TOKEN` (worker token; overrides legacy token)
+- `HDCF_WORKER_TOKEN_PREV` (previous worker token)
+- `HDCF_WORKER_TOKEN_SECRET` (optional signing secret for worker tokens)
+- `HDCF_WORKER_TOKEN_TTL_SECONDS` (default `3600`)
 - `HDCF_HEARTBEAT_TIMEOUT_SECONDS` (default `60`)
 - `HDCF_RECONCILE_INTERVAL_SECONDS` (default `10`)
 - `HDCF_CLEANUP_INTERVAL_SECONDS` (default `300`)
 - `HDCF_JOBS_RETENTION_COMPLETED_DAYS` (default `30`)
 - `HDCF_ARTIFACTS_RETENTION_DAYS` (default `14`)
 - `HDCF_EVENTS_RETENTION_DAYS` (default `30`)
+- `HDCF_TLS_CERT` (optional path for HTTPS cert)
+- `HDCF_TLS_KEY` (optional path for HTTPS key)
+- `HDCF_TLS_CLIENT_CA` (optional CA cert for worker client auth)
 
 Control-plane cleanup controls:
 - `-cleanup-interval-seconds` (how often retention sweeps run)
 - `-jobs-retention-completed-days` (how long terminal jobs stay in sqlite)
 - `-artifacts-retention-days` (how long terminal artifact paths are eligible for on-disk cleanup)
 - `-events-retention-days` (how long audit events are retained)
+- `-tls-cert`, `-tls-key` (start HTTPS control plane)
+- `-tls-client-ca` (optional CA for optional client cert validation)
+- `-tls-require-client-cert` (require and verify worker client certs)
 
 ### 2) Start worker on ASUS
 
 ```bash
-go run ./cmd/worker -control-url http://<mac-ip>:8080 -token dev-token -log-dir ./worker-logs
+go run ./cmd/worker -control-url https://<mac-ip>:8080 -worker-token dev-token -log-dir ./worker-logs
 ```
 
 Worker options:
 
 - `-control-url` (default `http://localhost:8080`)
 - `-worker-id` (default `hostname-<generated>`)
-- `-token` (default `dev-token`)
+- `-token` (legacy fallback token, default `dev-token`)
+- `-worker-token` (defaults to `-token`)
+- `-worker-token-secret` (optional HMAC secret for signed token mode)
+- `-worker-token-ttl-seconds` (default `3600`)
+- `-tls-ca` (ca bundle for control-plane cert)
+- `-tls-client-cert` (client cert for mTLS)
+- `-tls-client-key` (client key for mTLS)
 - `-capabilities` (default ``, comma-separated worker capabilities, e.g. `gpu,ssd`)
 - `-poll-interval-seconds` (default `3`)
 - `-heartbeat-interval-seconds` (default `5`)
@@ -62,6 +80,19 @@ Environment variables:
 - `HDCF_WORKER_ID`
 - `HDCF_WORKER_LOG_RETENTION_DAYS` (default `30`)
 - `HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS` (default `300`)
+- `HDCF_TLS_CA` (ca bundle for control-plane cert)
+- `HDCF_TLS_CLIENT_CERT` (client cert for mTLS)
+- `HDCF_TLS_CLIENT_KEY` (client key for mTLS)
+- `HDCF_WORKER_TOKEN` (worker token; defaults to `HDCF_API_TOKEN`)
+- `HDCF_WORKER_TOKEN_SECRET` (HMAC secret for signed token mode)
+- `HDCF_WORKER_TOKEN_TTL_SECONDS` (default `3600`)
+
+## Security model
+
+- Admin endpoints (`/jobs`, `/jobs/{id}`, `/abort`, `/workers`, `/events`) require admin credentials.
+- Worker endpoints (`/register`, `/next-job`, `/ack`, `/heartbeat`, `/reconnect`, `/complete`, `/fail`) require worker credentials.
+- If `-worker-token-secret` is set on both sides, workers use short-lived signed token format `v1.<payload>.<sig>`.
+- Use TLS (`-tls-cert`/`-tls-key`) for HTTPS and consider mTLS with `-tls-client-ca` + `-tls-require-client-cert`.
 
 Retention and cleanup behavior:
 - Control plane runs periodic retention sweeps on `-cleanup-interval-seconds`.
@@ -108,7 +139,8 @@ Advanced scheduling fields are accepted directly by the API as part of `POST /jo
 - `GET /workers`
 - `POST /complete`
 - `POST /fail`
-- `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `limit`)
+- `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `since_id`, `limit`)  
+  `since_id` returns only events with `id > since_id` for incremental polling.
 
 Queue ordering behavior:
 - `GET /next-job` claims from `PENDING` jobs by descending `priority`, then ascending `created_at`, then ascending `job_id`.
@@ -119,7 +151,7 @@ Read/observability behavior:
 - `GET /jobs` returns job list entries with state, timestamps, attempt counters, worker assignment, and heartbeat age for jobs with active workers.
 - `GET /jobs/{job_id}` returns a single job detail payload with the same fields.
 - `GET /workers` returns worker rows with heartbeat age in seconds and optional latest `heartbeat_metrics`.
-- `GET /events` returns durable control-plane structured events (filtered by component/event/worker/job with a default descending order and configurable limit).  
+- `GET /events` returns durable control-plane structured events (filtered by component/event/worker/job, optional `since_id` cursor, with a default descending order and configurable limit).  
   Use this as the primary recovery audit trail before touching the database directly.
 
 Abort behavior:
