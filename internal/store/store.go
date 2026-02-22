@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,14 @@ type Store struct {
 	maxConcurrentRetriesPerWorker      int
 	preemptBacklogThreshold            int
 	preemptHighPriorityMinimumPriority int
+}
+
+type MigrationDiagnostics struct {
+	Healthy        bool                       `json:"healthy"`
+	MissingTables  []string                   `json:"missing_tables"`
+	MissingColumns map[string][]string         `json:"missing_columns"`
+	MissingIndexes map[string][]string         `json:"missing_indexes"`
+	TableCounts    map[string]int64           `json:"table_counts"`
 }
 
 type StoreOptions struct {
@@ -100,6 +109,205 @@ func Open(path string, heartbeatTimeout time.Duration, options StoreOptions) (*S
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) MigrationDiagnostics(ctx context.Context) (MigrationDiagnostics, error) {
+	diag := MigrationDiagnostics{
+		MissingColumns: map[string][]string{},
+		MissingIndexes: map[string][]string{},
+		TableCounts:    map[string]int64{},
+	}
+	if err := s.ping(ctx); err != nil {
+		return diag, err
+	}
+
+	requiredTables := map[string]struct{}{
+		"jobs":         {},
+		"workers":      {},
+		"audit_events": {},
+	}
+	requiredColumns := map[string][]string{
+		"jobs": {
+			"id", "status", "command", "args", "working_dir", "timeout_ms", "priority", "scheduled_at", "needs_gpu",
+			"requirements", "created_at", "updated_at", "attempt_count", "max_attempts", "worker_id", "assignment_id",
+			"assignment_expires_at", "last_error", "completion_seq", "result_path", "artifact_id",
+			"artifact_stdout_tmp_path", "artifact_stdout_path", "artifact_stdout_sha256", "artifact_stderr_tmp_path",
+			"artifact_stderr_path", "artifact_stderr_sha256", "artifact_storage_backend", "artifact_storage_location",
+			"artifact_upload_state", "artifact_upload_error", "updated_by",
+		},
+		"workers": {
+			"worker_id", "last_seen", "current_job_id", "status", "worker_capabilities", "registered_at", "registration_nonce",
+			"heartbeat_seq", "heartbeat_metrics",
+		},
+		"audit_events": {
+			"id", "ts", "component", "level", "event", "request_id", "worker_id", "job_id", "details",
+		},
+	}
+	requiredIndexes := map[string][]string{
+		"jobs": {
+			"idx_jobs_status_created_at",
+			"idx_jobs_status_queue_order",
+		},
+		"audit_events": {
+			"idx_audit_events_ts",
+			"idx_audit_events_component_event",
+			"idx_audit_events_component",
+			"idx_audit_events_event",
+			"idx_audit_events_ts_id",
+			"idx_audit_events_job",
+			"idx_audit_events_worker",
+			"idx_audit_events_component_event_ts_id",
+			"idx_audit_events_event_ts_id",
+			"idx_audit_events_worker_ts_id",
+			"idx_audit_events_job_ts_id",
+		},
+	}
+
+	for table := range requiredTables {
+		exists, err := s.tableExists(ctx, table)
+		if err != nil {
+			return diag, err
+		}
+		if !exists {
+			diag.MissingTables = append(diag.MissingTables, table)
+			continue
+		}
+
+		var count int64
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM "+table).Scan(&count); err != nil {
+			return diag, err
+		}
+		diag.TableCounts[table] = count
+
+		columns, err := s.tableColumns(ctx, table)
+		if err != nil {
+			return diag, err
+		}
+		required := requiredColumns[table]
+		missingColumns := make([]string, 0, len(required))
+		for _, name := range required {
+			if _, ok := columns[name]; !ok {
+				missingColumns = append(missingColumns, name)
+			}
+		}
+		if len(missingColumns) > 0 {
+			sort.Strings(missingColumns)
+			diag.MissingColumns[table] = missingColumns
+		}
+
+		indexes, err := s.tableIndexes(ctx, table)
+		if err != nil {
+			return diag, err
+		}
+		required = requiredIndexes[table]
+		for _, requiredIdx := range required {
+			if _, ok := indexes[requiredIdx]; !ok {
+				diag.MissingIndexes[table] = append(diag.MissingIndexes[table], requiredIdx)
+			}
+		}
+		if len(diag.MissingIndexes[table]) > 0 {
+			sort.Strings(diag.MissingIndexes[table])
+		}
+	}
+
+	sort.Strings(diag.MissingTables)
+
+	if len(diag.MissingTables) > 0 {
+		return diag, nil
+	}
+
+	if len(diag.MissingColumns) > 0 {
+		nonEmpty := false
+		for _, cols := range diag.MissingColumns {
+			if len(cols) > 0 {
+				nonEmpty = true
+				break
+			}
+		}
+		if nonEmpty {
+			return diag, nil
+		}
+		diag.MissingColumns = nil
+	}
+	if len(diag.MissingIndexes) > 0 {
+		nonEmpty := false
+		for _, idx := range diag.MissingIndexes {
+			if len(idx) > 0 {
+				nonEmpty = true
+				break
+			}
+		}
+		if nonEmpty {
+			return diag, nil
+		}
+		diag.MissingIndexes = nil
+	}
+	diag.Healthy = true
+	return diag, nil
+}
+
+func (s *Store) tableExists(ctx context.Context, table string) (bool, error) {
+	var name string
+	err := s.db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := map[string]struct{}{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
+}
+
+func (s *Store) tableIndexes(ctx context.Context, table string) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA index_list("+table+")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	indexes := map[string]struct{}{}
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return nil, err
+		}
+		indexes[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return indexes, nil
+}
+
+func (s *Store) ping(ctx context.Context) error {
+	var one int
+	return s.db.QueryRowContext(ctx, "SELECT 1").Scan(&one)
 }
 
 func (s *Store) initSchema(ctx context.Context) error {

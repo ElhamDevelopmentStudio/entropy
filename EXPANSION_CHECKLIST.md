@@ -209,13 +209,23 @@ Progress:
 - Added parallel `RecoverStaleWorkers` call coverage for contention.
 - Added end-to-end completion verification for all jobs after recovery and reprocessing.
 
-13. `[ ]` P5-13 — Config and deployment hardening
-Current status: env/flags only
+13. `[x]` P5-13 — Config and deployment hardening
+Current status: complete
 Target: process startup files
 Implementation tasks:
-- Add example config file support for all major values.
-- Provide sample systemd/supervisor startup for control plane and worker.
-- Add migration diagnostics and health endpoint (`/healthz`) with DB and fs checks.
+- Added example config files for major control and worker settings:
+  - `deploy/control-config.example.json`
+  - `deploy/worker-config.example.json`
+- Added sample startup templates for unattended boot:
+  - `deploy/hdcf-control.service`
+  - `deploy/hdcf-worker.service`
+  - `deploy/hdcf-control.supervisor.conf`
+  - `deploy/hdcf-worker.supervisor.conf`
+- Added migration diagnostics and health endpoint (`/healthz`) with:
+  - database connectivity/schema check
+  - migration completeness check
+  - DB directory filesystem writeability check
+- Wired config file support via `-config` and env `HDCF_CONTROL_CONFIG` / `HDCF_WORKER_CONFIG`.
 Acceptance criteria:
 - Reliable boot-time run in unattended environments.
 

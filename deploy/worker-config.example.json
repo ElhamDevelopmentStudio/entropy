@@ -1,0 +1,31 @@
+{
+  "control_url": "https://control-host:8080",
+  "worker_id": "asus-worker-01",
+  "worker_nonce": "",
+  "capabilities": [
+    "cpu",
+    "gpu"
+  ],
+  "token": "",
+  "worker_token": "change-me-worker",
+  "worker_token_secret": "",
+  "worker_token_ttl_seconds": 3600,
+  "poll_interval_seconds": 3,
+  "heartbeat_interval_seconds": 5,
+  "request_timeout_seconds": 10,
+  "log_dir": "/var/lib/hdcf/worker-logs",
+  "state_file": "/var/lib/hdcf/worker-logs/worker-state.json",
+  "log_retention_days": 30,
+  "log_cleanup_interval_seconds": 300,
+  "heartbeat_metrics": false,
+  "command_allowlist": false,
+  "allowed_commands": "",
+  "allowed_working_dirs": "",
+  "artifact_storage_backend": "local",
+  "artifact_storage_location": "",
+  "require_non_root": true,
+  "dry_run": false,
+  "tls_ca": "",
+  "tls_client_cert": "",
+  "tls_client_key": ""
+}

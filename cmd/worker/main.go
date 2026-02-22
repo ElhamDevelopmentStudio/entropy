@@ -143,42 +143,80 @@ type workerConfig struct {
 	tlsClientKey     string
 }
 
+type workerConfigFile struct {
+	ControlURL               *string  `json:"control_url"`
+	WorkerID                 *string  `json:"worker_id"`
+	WorkerNonce              *string  `json:"worker_nonce"`
+	Capabilities             []string `json:"capabilities"`
+	Token                    *string  `json:"token"`
+	WorkerToken              *string  `json:"worker_token"`
+	WorkerTokenSecret        *string  `json:"worker_token_secret"`
+	WorkerTokenTTLSeconds    *int64   `json:"worker_token_ttl_seconds"`
+	PollIntervalSeconds      *int64   `json:"poll_interval_seconds"`
+	HeartbeatIntervalSeconds *int64   `json:"heartbeat_interval_seconds"`
+	RequestTimeoutSeconds    *int64   `json:"request_timeout_seconds"`
+	LogDir                  *string  `json:"log_dir"`
+	StateFile               *string  `json:"state_file"`
+	LogRetentionDays        *int64   `json:"log_retention_days"`
+	LogCleanupIntervalSec   *int64   `json:"log_cleanup_interval_seconds"`
+	ReportMetrics           *bool    `json:"heartbeat_metrics"`
+	CommandAllowlist        *bool    `json:"command_allowlist"`
+	AllowedCommands         *string  `json:"allowed_commands"`
+	AllowedWorkingDirs      *string  `json:"allowed_working_dirs"`
+	ArtifactStorageBackend  *string  `json:"artifact_storage_backend"`
+	ArtifactStorageLocation *string  `json:"artifact_storage_location"`
+	RequireNonRoot          *bool    `json:"require_non_root"`
+	DryRun                  *bool    `json:"dry_run"`
+	TLSCA                   *string  `json:"tls_ca"`
+	TLSClientCert           *string  `json:"tls_client_cert"`
+	TLSClientKey            *string  `json:"tls_client_key"`
+}
+
 func parseWorkerConfig() workerConfig {
+	cfgFile := loadWorkerConfig(workerConfigPathFromArgs())
 	var cfg workerConfig
 	var token string
-	flag.StringVar(&cfg.controlURL, "control-url", getenv("HDCF_CONTROL_URL", "http://localhost:8080"), "control plane url")
-	flag.StringVar(&cfg.workerID, "worker-id", getenv("HDCF_WORKER_ID", ""), "worker id")
-	flag.StringVar(&cfg.nonce, "worker-nonce", getenv("HDCF_WORKER_NONCE", ""), "optional registration nonce")
-	capabilities := flag.String("capabilities", getenv("HDCF_WORKER_CAPABILITIES", ""), "comma-separated worker capabilities")
-	flag.StringVar(&token, "token", getenv("HDCF_API_TOKEN", "dev-token"), "legacy api token")
+	flag.StringVar(&cfg.controlURL, "control-url", resolveWorkerConfigString(cfgFile.ControlURL, "HDCF_CONTROL_URL", "http://localhost:8080"), "control plane url")
+	flag.StringVar(&cfg.workerID, "worker-id", resolveWorkerConfigString(cfgFile.WorkerID, "HDCF_WORKER_ID", ""), "worker id")
+	flag.StringVar(&cfg.nonce, "worker-nonce", resolveWorkerConfigString(cfgFile.WorkerNonce, "HDCF_WORKER_NONCE", ""), "optional registration nonce")
+	capabilitiesDefault := resolveWorkerConfigStringList(cfgFile.Capabilities, "HDCF_WORKER_CAPABILITIES", "")
+	capabilities := flag.String("capabilities", capabilitiesDefault, "comma-separated worker capabilities")
+	flag.StringVar(&token, "token", resolveWorkerConfigString(cfgFile.Token, "HDCF_API_TOKEN", "dev-token"), "legacy api token")
 	var workerToken string
-	flag.StringVar(&workerToken, "worker-token", getenv("HDCF_WORKER_TOKEN", ""), "worker token")
-	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", getenv("HDCF_WORKER_TOKEN_SECRET", ""), "secret for signed worker tokens")
-	var tokenTTLSeconds int
-	flag.IntVar(&tokenTTLSeconds, "worker-token-ttl-seconds", int(getenvInt("HDCF_WORKER_TOKEN_TTL_SECONDS", 3600)), "signed worker token ttl seconds")
+	var workerTokenDefault string
+	if cfgFile.WorkerToken != nil && strings.TrimSpace(*cfgFile.WorkerToken) != "" {
+		workerTokenDefault = strings.TrimSpace(*cfgFile.WorkerToken)
+	} else if envToken := strings.TrimSpace(os.Getenv("HDCF_WORKER_TOKEN")); envToken != "" {
+		workerTokenDefault = envToken
+	}
+	flag.StringVar(&workerToken, "worker-token", workerTokenDefault, "worker token")
+	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", resolveWorkerConfigString(cfgFile.WorkerTokenSecret, "HDCF_WORKER_TOKEN_SECRET", ""), "secret for signed worker tokens")
+	var tokenTTLSeconds int64
+	flag.Int64Var(&tokenTTLSeconds, "worker-token-ttl-seconds", resolveWorkerConfigInt64(cfgFile.WorkerTokenTTLSeconds, "HDCF_WORKER_TOKEN_TTL_SECONDS", 3600), "signed worker token ttl seconds")
 	var pollSec int
 	var heartbeatSec int
 	var timeoutSec int
 	var logRetentionDays int
 	var logCleanupIntervalSec int
-	allowedCommands := flag.String("allowed-commands", getenv("HDCF_WORKER_ALLOWED_COMMANDS", ""), "comma-separated allowed command binaries when -command-allowlist is enabled")
-	allowedWorkingDirs := flag.String("allowed-working-dirs", getenv("HDCF_WORKER_ALLOWED_WORKING_DIRS", ""), "comma-separated allowed working directories for strict job execution checks")
-	artifactStorageBackend := flag.String("artifact-storage-backend", getenv("HDCF_ARTIFACT_STORAGE_BACKEND", hdcf.ArtifactStorageBackendLocal), "artifact storage backend: local|nfs|s3")
-	artifactStorageLocation := flag.String("artifact-storage-location", getenv("HDCF_ARTIFACT_STORAGE_LOCATION", ""), "storage location for non-local artifact backends")
-	commandAllowlist := flag.Bool("command-allowlist", getenvBool("HDCF_WORKER_COMMAND_ALLOWLIST", false), "enforce command allowlist before execution")
-	requireNonRoot := flag.Bool("require-non-root", getenvBool("HDCF_WORKER_REQUIRE_NON_ROOT", false), "reject running jobs when this process is running as root")
-	dryRun := flag.Bool("dry-run", getenvBool("HDCF_WORKER_DRY_RUN", false), "validate and simulate execution without running commands")
-	flag.IntVar(&pollSec, "poll-interval-seconds", 3, "poll interval seconds")
-	flag.IntVar(&heartbeatSec, "heartbeat-interval-seconds", 5, "heartbeat interval seconds")
-	flag.BoolVar(&cfg.reportMetrics, "heartbeat-metrics", false, "include optional resource metrics in heartbeat payload")
-	flag.IntVar(&timeoutSec, "request-timeout-seconds", 10, "request timeout seconds")
-	flag.IntVar(&logRetentionDays, "log-retention-days", int(getenvInt("HDCF_WORKER_LOG_RETENTION_DAYS", 30)), "days to retain worker local log/artifact files")
-	flag.IntVar(&logCleanupIntervalSec, "log-cleanup-interval-seconds", int(getenvInt("HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS", 300)), "log cleanup interval seconds")
-	flag.StringVar(&cfg.logDir, "log-dir", "worker-logs", "path for local job logs")
-	flag.StringVar(&cfg.stateFile, "state-file", "", "path to reconnect state file (default worker-logs/worker-state.json)")
-	flag.StringVar(&cfg.tlsCA, "tls-ca", getenv("HDCF_TLS_CA", ""), "trusted control plane CA certificate")
-	flag.StringVar(&cfg.tlsClientCert, "tls-client-cert", getenv("HDCF_TLS_CLIENT_CERT", ""), "client certificate for mTLS")
-	flag.StringVar(&cfg.tlsClientKey, "tls-client-key", getenv("HDCF_TLS_CLIENT_KEY", ""), "client private key for mTLS")
+	allowedCommands := flag.String("allowed-commands", resolveWorkerConfigString(cfgFile.AllowedCommands, "HDCF_WORKER_ALLOWED_COMMANDS", ""), "comma-separated allowed command binaries when -command-allowlist is enabled")
+	allowedWorkingDirs := flag.String("allowed-working-dirs", resolveWorkerConfigString(cfgFile.AllowedWorkingDirs, "HDCF_WORKER_ALLOWED_WORKING_DIRS", ""), "comma-separated allowed working directories for strict job execution checks")
+	artifactStorageBackend := flag.String("artifact-storage-backend", resolveWorkerConfigString(cfgFile.ArtifactStorageBackend, "HDCF_ARTIFACT_STORAGE_BACKEND", hdcf.ArtifactStorageBackendLocal), "artifact storage backend: local|nfs|s3")
+	artifactStorageLocation := flag.String("artifact-storage-location", resolveWorkerConfigString(cfgFile.ArtifactStorageLocation, "HDCF_ARTIFACT_STORAGE_LOCATION", ""), "storage location for non-local artifact backends")
+	commandAllowlist := flag.Bool("command-allowlist", resolveWorkerConfigBool(cfgFile.CommandAllowlist, "HDCF_WORKER_COMMAND_ALLOWLIST", false), "enforce command allowlist before execution")
+	requireNonRoot := flag.Bool("require-non-root", resolveWorkerConfigBool(cfgFile.RequireNonRoot, "HDCF_WORKER_REQUIRE_NON_ROOT", false), "reject running jobs when this process is running as root")
+	dryRun := flag.Bool("dry-run", resolveWorkerConfigBool(cfgFile.DryRun, "HDCF_WORKER_DRY_RUN", false), "validate and simulate execution without running commands")
+	flag.IntVar(&pollSec, "poll-interval-seconds", int(resolveWorkerConfigInt64(cfgFile.PollIntervalSeconds, "HDCF_WORKER_POLL_INTERVAL_SECONDS", 3)), "poll interval seconds")
+	flag.IntVar(&heartbeatSec, "heartbeat-interval-seconds", int(resolveWorkerConfigInt64(cfgFile.HeartbeatIntervalSeconds, "HDCF_WORKER_HEARTBEAT_INTERVAL_SECONDS", 5)), "heartbeat interval seconds")
+	flag.BoolVar(&cfg.reportMetrics, "heartbeat-metrics", resolveWorkerConfigBool(cfgFile.ReportMetrics, "HDCF_WORKER_HEARTBEAT_METRICS", false), "include optional resource metrics in heartbeat payload")
+	flag.IntVar(&timeoutSec, "request-timeout-seconds", int(resolveWorkerConfigInt64(cfgFile.RequestTimeoutSeconds, "HDCF_WORKER_REQUEST_TIMEOUT_SECONDS", 10)), "request timeout seconds")
+	flag.IntVar(&logRetentionDays, "log-retention-days", int(resolveWorkerConfigInt64(cfgFile.LogRetentionDays, "HDCF_WORKER_LOG_RETENTION_DAYS", 30)), "days to retain worker local log/artifact files")
+	flag.IntVar(&logCleanupIntervalSec, "log-cleanup-interval-seconds", int(resolveWorkerConfigInt64(cfgFile.LogCleanupIntervalSec, "HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS", 300)), "log cleanup interval seconds")
+	flag.StringVar(&cfg.logDir, "log-dir", resolveWorkerConfigString(cfgFile.LogDir, "HDCF_WORKER_LOG_DIR", "worker-logs"), "path for local job logs")
+	flag.StringVar(&cfg.stateFile, "state-file", resolveWorkerConfigString(cfgFile.StateFile, "HDCF_WORKER_STATE_FILE", ""), "path to reconnect state file (default worker-logs/worker-state.json)")
+	flag.StringVar(&cfg.tlsCA, "tls-ca", resolveWorkerConfigString(cfgFile.TLSCA, "HDCF_TLS_CA", ""), "trusted control plane CA certificate")
+	flag.StringVar(&cfg.tlsClientCert, "tls-client-cert", resolveWorkerConfigString(cfgFile.TLSClientCert, "HDCF_TLS_CLIENT_CERT", ""), "client certificate for mTLS")
+	flag.StringVar(&cfg.tlsClientKey, "tls-client-key", resolveWorkerConfigString(cfgFile.TLSClientKey, "HDCF_TLS_CLIENT_KEY", ""), "client private key for mTLS")
+	flag.String("config", workerConfigPathFromArgs(), "path to worker JSON config file (defaults to HDCF_WORKER_CONFIG)")
 	flag.Parse()
 
 	cfg.token = strings.TrimSpace(workerToken)
@@ -222,6 +260,84 @@ func parseWorkerConfig() workerConfig {
 	}
 	cfg.capabilities = splitCapabilities(*capabilities)
 	return cfg
+}
+
+func workerConfigPathFromArgs() string {
+	path := strings.TrimSpace(os.Getenv("HDCF_WORKER_CONFIG"))
+	for i := 1; i < len(os.Args); i++ {
+		arg := strings.TrimSpace(os.Args[i])
+		switch {
+		case arg == "-config":
+			if i+1 < len(os.Args) {
+				path = strings.TrimSpace(os.Args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "-config="):
+			path = strings.TrimSpace(strings.TrimPrefix(arg, "-config="))
+		case arg == "--config":
+			if i+1 < len(os.Args) {
+				path = strings.TrimSpace(os.Args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "--config="):
+			path = strings.TrimSpace(strings.TrimPrefix(arg, "--config="))
+		}
+	}
+	return path
+}
+
+func loadWorkerConfig(path string) workerConfigFile {
+	if strings.TrimSpace(path) == "" {
+		return workerConfigFile{}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("read worker config: %v", err)
+	}
+	var cfg workerConfigFile
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		log.Fatalf("parse worker config: %v", err)
+	}
+	return cfg
+}
+
+func resolveWorkerConfigString(raw *string, envName, fallback string) string {
+	if raw != nil && strings.TrimSpace(*raw) != "" {
+		return strings.TrimSpace(*raw)
+	}
+	if envName != "" {
+		if envVal := strings.TrimSpace(os.Getenv(envName)); envVal != "" {
+			return envVal
+		}
+	}
+	return fallback
+}
+
+func resolveWorkerConfigStringList(raw []string, envName, fallback string) string {
+	if len(raw) > 0 {
+		clean := splitCSV(strings.Join(raw, ","))
+		if len(clean) > 0 {
+			return strings.Join(clean, ",")
+		}
+	}
+	return resolveWorkerConfigString(nil, envName, fallback)
+}
+
+func resolveWorkerConfigInt64(raw *int64, envName string, fallback int64) int64 {
+	if raw != nil {
+		return *raw
+	}
+	if envName == "" {
+		return fallback
+	}
+	return getenvInt(envName, fallback)
+}
+
+func resolveWorkerConfigBool(raw *bool, envName string, fallback bool) bool {
+	if raw != nil {
+		return *raw
+	}
+	return getenvBool(envName, fallback)
 }
 
 func buildWorkerHTTPClient(cfg workerConfig) (*http.Client, error) {

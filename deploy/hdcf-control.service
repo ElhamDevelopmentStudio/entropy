@@ -1,0 +1,18 @@
+[Unit]
+Description=HDCF Control Plane
+After=network.target
+
+[Service]
+Type=simple
+User=hdcf
+Group=hdcf
+Environment="HDCF_CONTROL_CONFIG=/etc/hdcf/control-config.json"
+WorkingDirectory=/opt/hdcf
+ExecStart=/usr/local/bin/hdcf-control -config /etc/hdcf/control-config.json
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitInterval=60
+
+[Install]
+WantedBy=multi-user.target

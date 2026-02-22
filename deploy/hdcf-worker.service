@@ -1,0 +1,18 @@
+[Unit]
+Description=HDCF Worker
+After=network.target
+
+[Service]
+Type=simple
+User=hdcf
+Group=hdcf
+Environment="HDCF_WORKER_CONFIG=/etc/hdcf/worker-config.json"
+WorkingDirectory=/opt/hdcf
+ExecStart=/usr/local/bin/hdcf-worker -config /etc/hdcf/worker-config.json
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitInterval=60
+
+[Install]
+WantedBy=multi-user.target

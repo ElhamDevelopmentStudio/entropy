@@ -16,10 +16,19 @@ This repository contains an implementation of the feasibility plan from `mvp.md`
 go run ./cmd/control -addr :8080 -db ./jobs.db -admin-token dev-token -worker-token dev-token
 ```
 
+or using config file:
+
+```bash
+go run ./cmd/control -config deploy/control-config.example.json
+```
+
+The same path can be provided with `HDCF_CONTROL_CONFIG=/etc/hdcf/control-config.json`.
+
 Environment variables available:
 
 - `HDCF_ADDR` (default `:8080`)
 - `HDCF_DB_PATH` (default `jobs.db`)
+- `HDCF_CONTROL_CONFIG` (path to JSON config file)
 - `HDCF_API_TOKEN` (legacy shared token, default `dev-token`)
 - `HDCF_ADMIN_TOKEN` (admin token; overrides legacy token)
 - `HDCF_ADMIN_TOKEN_PREV` (previous admin token)
@@ -55,12 +64,21 @@ Scheduling controls:
 - `-max-retry-concurrency-per-worker` (max concurrent retry jobs per worker; `0` means unlimited)
 - `-preempt-high-priority-backlog-threshold` (gates lower-priority jobs when high-priority backlog is high)
 - `-preempt-high-priority-floor` (priority threshold used during preemption mode)
+- `-config` (JSON file path; defaults to `HDCF_CONTROL_CONFIG`)
 
 ### 2) Start worker on ASUS
 
 ```bash
 go run ./cmd/worker -control-url https://<mac-ip>:8080 -worker-token dev-token -log-dir ./worker-logs
 ```
+
+or using config file:
+
+```bash
+go run ./cmd/worker -config deploy/worker-config.example.json
+```
+
+The same path can be provided with `HDCF_WORKER_CONFIG=/etc/hdcf/worker-config.json`.
 
 Worker options:
 
@@ -88,6 +106,7 @@ Worker options:
 - `-allowed-working-dirs` (default ``) — comma-separated list of allowed working directories
 - `-require-non-root` (default `false`) — reject jobs while running as root
 - `-dry-run` (default `false`) — validate policy and write simulated artifacts without executing jobs
+- `-config` (JSON file path; defaults to `HDCF_WORKER_CONFIG`)
 
 Environment variables:
 
@@ -107,6 +126,7 @@ Environment variables:
 - `HDCF_TLS_CA` (ca bundle for control-plane cert)
 - `HDCF_TLS_CLIENT_CERT` (client cert for mTLS)
 - `HDCF_TLS_CLIENT_KEY` (client key for mTLS)
+- `HDCF_WORKER_CONFIG` (path to JSON config file)
 - `HDCF_WORKER_TOKEN` (worker token; defaults to `HDCF_API_TOKEN`)
 - `HDCF_WORKER_TOKEN_SECRET` (HMAC secret for signed token mode)
 - `HDCF_WORKER_TOKEN_TTL_SECONDS` (default `3600`)
@@ -124,6 +144,18 @@ Security note:
 - If `-worker-token-secret` is set on both sides, workers use short-lived signed token format `v1.<payload>.<sig>`.
 - Use TLS (`-tls-cert`/`-tls-key`) for HTTPS and consider mTLS with `-tls-client-ca` + `-tls-require-client-cert`.
 
+Health endpoint:
+
+- `GET /healthz` (no auth) reports startup readiness and control-plane health.
+  - DB connectivity and migration/schema checks.
+  - DB filesystem writeability probe.
+
+Example:
+
+```bash
+curl http://localhost:8080/healthz
+```
+
 Retention and cleanup behavior:
 - Control plane runs periodic retention sweeps on `-cleanup-interval-seconds`.
 - Control plane sweeps can:
@@ -132,6 +164,17 @@ Retention and cleanup behavior:
   - delete audit events older than `-events-retention-days`;
   - emit cleanup audit events (`control.cleanup*`) with counts and deletion outcomes.
 - Worker retains log/artifact files locally and periodically removes old artifacts via `log-retention-days`.
+
+Deployment examples (sample files in `deploy/`):
+
+- `control-config.example.json`
+- `worker-config.example.json`
+- `hdcf-control.service`
+- `hdcf-worker.service`
+- `hdcf-control.supervisor.conf`
+- `hdcf-worker.supervisor.conf`
+
+Each file is intentionally minimal and should be adapted to your host paths and user accounts.
 
 ### 3) Submit and inspect jobs with `hdcfctl`
 
@@ -219,6 +262,7 @@ Advanced scheduling fields are accepted directly by the API as part of `POST /jo
 - `POST /complete`
 - `POST /fail`
 - `GET /metrics` (admin)
+- `GET /healthz` (authless)
 - `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `since_id`, `limit`)  
   `since_id` returns only events with `id > since_id` for incremental polling.
 - `POST /reconnect` supports optional `current_job_id` and completed-job replay payload, and can now be manually invoked via `hdcfctl replay`.

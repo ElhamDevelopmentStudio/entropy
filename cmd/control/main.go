@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -74,6 +75,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ui", dashboardUI())
 	mux.HandleFunc("/ui/", dashboardUI())
+	mux.HandleFunc("/healthz", healthzHandler(s, cfg.dbPath))
 	mux.HandleFunc("/jobs", withAdminAuth(&cfg, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAdminAuth(&cfg, getJobHandler(s)))
 	mux.HandleFunc("/metrics", withAdminAuth(&cfg, metricsHandler(s)))
@@ -612,23 +614,68 @@ type controlConfig struct {
 	eventsRetentionDays       int
 }
 
+type controlConfigFile struct {
+	Addr                         *string `json:"addr"`
+	DBPath                       *string `json:"db_path"`
+	Token                        *string `json:"token"`
+	AdminToken                   *string `json:"admin_token"`
+	AdminTokenPrev               *string `json:"admin_token_prev"`
+	WorkerToken                  *string `json:"worker_token"`
+	WorkerTokenPrev              *string `json:"worker_token_prev"`
+	WorkerTokenSecret            *string `json:"worker_token_secret"`
+	WorkerTokenTTLSeconds        *int64  `json:"worker_token_ttl_seconds"`
+	TLSCert                      *string `json:"tls_cert"`
+	TLSKey                       *string `json:"tls_key"`
+	TLSClientCA                  *string `json:"tls_client_ca"`
+	TLSRequireClientCert          *bool   `json:"tls_require_client_cert"`
+	HeartbeatTimeoutSeconds       *int64  `json:"heartbeat_timeout_seconds"`
+	ReconcileIntervalSeconds      *int64  `json:"reconcile_interval_seconds"`
+	CleanupIntervalSeconds        *int64  `json:"cleanup_interval_seconds"`
+	QueueAgingWindowSeconds      *int64  `json:"queue_aging_window_seconds"`
+	MaxRetryConcurrencyPerWorker  *int64  `json:"max_retry_concurrency_per_worker"`
+	PreemptBacklogThreshold      *int64  `json:"preempt_high_priority_backlog_threshold"`
+	PreemptPriorityFloor         *int64  `json:"preempt_high_priority_floor"`
+	JobsRetentionCompletedDays    *int64  `json:"jobs_retention_completed_days"`
+	ArtifactsRetentionDays        *int64  `json:"artifacts_retention_days"`
+	EventsRetentionDays          *int64  `json:"events_retention_days"`
+}
+
+type controlHealthCheck struct {
+	Status   string                       `json:"status"`
+	Checked  string                       `json:"checked_at"`
+	Checks  map[string]map[string]any     `json:"checks"`
+}
+
 func parseConfig() controlConfig {
 	var cfg controlConfig
+	cfgFile := controlLoadConfig(controlConfigPathFromArgs())
+	defaultAddr := resolveConfigString(cfgFile.Addr, "HDCF_ADDR", ":8080")
+	defaultDBPath := resolveConfigString(cfgFile.DBPath, "HDCF_DB_PATH", "jobs.db")
+	defaultToken := resolveConfigString(cfgFile.Token, "HDCF_API_TOKEN", "dev-token")
+	defaultAdminToken := resolveConfigString(cfgFile.AdminToken, "HDCF_ADMIN_TOKEN", "")
+	defaultAdminTokenPrev := resolveConfigString(cfgFile.AdminTokenPrev, "HDCF_ADMIN_TOKEN_PREV", "")
+	defaultWorkerToken := resolveConfigString(cfgFile.WorkerToken, "HDCF_WORKER_TOKEN", "")
+	defaultWorkerTokenPrev := resolveConfigString(cfgFile.WorkerTokenPrev, "HDCF_WORKER_TOKEN_PREV", "")
+	defaultWorkerTokenSecret := resolveConfigString(cfgFile.WorkerTokenSecret, "HDCF_WORKER_TOKEN_SECRET", "")
+	defaultTLSCert := resolveConfigString(cfgFile.TLSCert, "HDCF_TLS_CERT", "")
+	defaultTLSKey := resolveConfigString(cfgFile.TLSKey, "HDCF_TLS_KEY", "")
+	defaultTLSClientCA := resolveConfigString(cfgFile.TLSClientCA, "HDCF_TLS_CLIENT_CA", "")
+	defaultTLSRequireClientCert := resolveConfigBool(cfgFile.TLSRequireClientCert, "HDCF_TLS_REQUIRE_CLIENT_CERT", false)
 	var legacyToken string
-	flag.StringVar(&cfg.addr, "addr", getenvDefault("HDCF_ADDR", ":8080"), "control plane listen addr")
-	flag.StringVar(&cfg.dbPath, "db", getenvDefault("HDCF_DB_PATH", "jobs.db"), "sqlite db path")
-	flag.StringVar(&legacyToken, "token", getenvDefault("HDCF_API_TOKEN", "dev-token"), "legacy shared token for admin and worker endpoints")
+	flag.StringVar(&cfg.addr, "addr", defaultAddr, "control plane listen addr")
+	flag.StringVar(&cfg.dbPath, "db", defaultDBPath, "sqlite db path")
+	flag.StringVar(&legacyToken, "token", defaultToken, "legacy shared token for admin and worker endpoints")
 	flag.StringVar(&cfg.adminToken, "admin-token", "", "admin token (overrides -token)")
-	flag.StringVar(&cfg.adminTokenPrev, "admin-token-prev", getenvDefault("HDCF_ADMIN_TOKEN_PREV", ""), "previous admin token (for rotation)")
+	flag.StringVar(&cfg.adminTokenPrev, "admin-token-prev", defaultAdminTokenPrev, "previous admin token (for rotation)")
 	flag.StringVar(&cfg.workerToken, "worker-token", "", "worker token (overrides -token)")
-	flag.StringVar(&cfg.workerTokenPrev, "worker-token-prev", getenvDefault("HDCF_WORKER_TOKEN_PREV", ""), "previous worker token (for rotation)")
-	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", getenvDefault("HDCF_WORKER_TOKEN_SECRET", ""), "secret for short-lived signed worker tokens")
+	flag.StringVar(&cfg.workerTokenPrev, "worker-token-prev", defaultWorkerTokenPrev, "previous worker token (for rotation)")
+	flag.StringVar(&cfg.workerTokenSecret, "worker-token-secret", defaultWorkerTokenSecret, "secret for short-lived signed worker tokens")
 	var workerTokenTTLSeconds int64
-	flag.Int64Var(&workerTokenTTLSeconds, "worker-token-ttl-seconds", getenvInt("HDCF_WORKER_TOKEN_TTL_SECONDS", 3600), "signed worker token TTL in seconds")
-	flag.StringVar(&cfg.tlsCert, "tls-cert", getenvDefault("HDCF_TLS_CERT", ""), "TLS certificate PEM for https control API")
-	flag.StringVar(&cfg.tlsKey, "tls-key", getenvDefault("HDCF_TLS_KEY", ""), "TLS private key PEM for https control API")
-	flag.StringVar(&cfg.tlsClientCA, "tls-client-ca", getenvDefault("HDCF_TLS_CLIENT_CA", ""), "CA certificate PEM to verify worker client certs when mTLS is enabled")
-	flag.BoolVar(&cfg.tlsRequireClientCert, "tls-require-client-cert", false, "require and verify client certificates")
+	flag.Int64Var(&workerTokenTTLSeconds, "worker-token-ttl-seconds", resolveConfigInt64(cfgFile.WorkerTokenTTLSeconds, "HDCF_WORKER_TOKEN_TTL_SECONDS", 3600), "signed worker token TTL in seconds")
+	flag.StringVar(&cfg.tlsCert, "tls-cert", defaultTLSCert, "TLS certificate PEM for https control API")
+	flag.StringVar(&cfg.tlsKey, "tls-key", defaultTLSKey, "TLS private key PEM for https control API")
+	flag.StringVar(&cfg.tlsClientCA, "tls-client-ca", defaultTLSClientCA, "CA certificate PEM to verify worker client certs when mTLS is enabled")
+	flag.BoolVar(&cfg.tlsRequireClientCert, "tls-require-client-cert", defaultTLSRequireClientCert, "require and verify client certificates")
 	var heartbeatSec int64
 	var reconcileSec int64
 	var cleanupIntervalSec int64
@@ -639,16 +686,17 @@ func parseConfig() controlConfig {
 	var jobsRetentionCompletedDays int64
 	var artifactsRetentionDays int64
 	var eventsRetentionDays int64
-	flag.Int64Var(&heartbeatSec, "heartbeat-timeout-seconds", int64(getenvInt("HDCF_HEARTBEAT_TIMEOUT_SECONDS", 60)), "heartbeat timeout seconds")
-	flag.Int64Var(&reconcileSec, "reconcile-interval-seconds", int64(getenvInt("HDCF_RECONCILE_INTERVAL_SECONDS", 10)), "reconcile interval seconds")
-	flag.Int64Var(&cleanupIntervalSec, "cleanup-interval-seconds", getenvInt("HDCF_CLEANUP_INTERVAL_SECONDS", 300), "cleanup interval seconds")
-	flag.Int64Var(&queueAgingWindowSeconds, "queue-aging-window-seconds", getenvInt("HDCF_QUEUE_AGING_WINDOW_SECONDS", 0), "aging window seconds for priority-based fairness")
-	flag.Int64Var(&maxConcurrentRetriesPerWorker, "max-retry-concurrency-per-worker", getenvInt("HDCF_MAX_RETRY_CONCURRENCY_PER_WORKER", 0), "max concurrent retry jobs per worker (0=unlimited)")
-	flag.Int64Var(&preemptBacklogThreshold, "preempt-high-priority-backlog-threshold", getenvInt("HDCF_PREEMPT_HIGH_PRIORITY_BACKLOG_THRESHOLD", 0), "if high-priority backlog exceeds threshold, temporarily gate lower priority jobs")
-	flag.Int64Var(&preemptHighPriorityMinimumPriority, "preempt-high-priority-floor", getenvInt("HDCF_PREEMPT_HIGH_PRIORITY_FLOOR", 0), "minimum priority during preemption mode")
-	flag.Int64Var(&jobsRetentionCompletedDays, "jobs-retention-completed-days", getenvInt("HDCF_JOBS_RETENTION_COMPLETED_DAYS", 30), "days to retain terminal jobs in sqlite")
-	flag.Int64Var(&artifactsRetentionDays, "artifacts-retention-days", getenvInt("HDCF_ARTIFACTS_RETENTION_DAYS", 14), "days to retain terminal artifact/log files (cleanup does not block scheduling)")
-	flag.Int64Var(&eventsRetentionDays, "events-retention-days", getenvInt("HDCF_EVENTS_RETENTION_DAYS", 30), "days to retain audit events")
+	flag.Int64Var(&heartbeatSec, "heartbeat-timeout-seconds", resolveConfigInt64(cfgFile.HeartbeatTimeoutSeconds, "HDCF_HEARTBEAT_TIMEOUT_SECONDS", 60), "heartbeat timeout seconds")
+	flag.Int64Var(&reconcileSec, "reconcile-interval-seconds", resolveConfigInt64(cfgFile.ReconcileIntervalSeconds, "HDCF_RECONCILE_INTERVAL_SECONDS", 10), "reconcile interval seconds")
+	flag.Int64Var(&cleanupIntervalSec, "cleanup-interval-seconds", resolveConfigInt64(cfgFile.CleanupIntervalSeconds, "HDCF_CLEANUP_INTERVAL_SECONDS", 300), "cleanup interval seconds")
+	flag.Int64Var(&queueAgingWindowSeconds, "queue-aging-window-seconds", resolveConfigInt64(cfgFile.QueueAgingWindowSeconds, "HDCF_QUEUE_AGING_WINDOW_SECONDS", 0), "aging window seconds for priority-based fairness")
+	flag.Int64Var(&maxConcurrentRetriesPerWorker, "max-retry-concurrency-per-worker", resolveConfigInt64(cfgFile.MaxRetryConcurrencyPerWorker, "HDCF_MAX_RETRY_CONCURRENCY_PER_WORKER", 0), "max concurrent retry jobs per worker (0=unlimited)")
+	flag.Int64Var(&preemptBacklogThreshold, "preempt-high-priority-backlog-threshold", resolveConfigInt64(cfgFile.PreemptBacklogThreshold, "HDCF_PREEMPT_HIGH_PRIORITY_BACKLOG_THRESHOLD", 0), "if high-priority backlog exceeds threshold, temporarily gate lower priority jobs")
+	flag.Int64Var(&preemptHighPriorityMinimumPriority, "preempt-high-priority-floor", resolveConfigInt64(cfgFile.PreemptPriorityFloor, "HDCF_PREEMPT_HIGH_PRIORITY_FLOOR", 0), "minimum priority during preemption mode")
+	flag.Int64Var(&jobsRetentionCompletedDays, "jobs-retention-completed-days", resolveConfigInt64(cfgFile.JobsRetentionCompletedDays, "HDCF_JOBS_RETENTION_COMPLETED_DAYS", 30), "days to retain terminal jobs in sqlite")
+	flag.Int64Var(&artifactsRetentionDays, "artifacts-retention-days", resolveConfigInt64(cfgFile.ArtifactsRetentionDays, "HDCF_ARTIFACTS_RETENTION_DAYS", 14), "days to retain terminal artifact/log files (cleanup does not block scheduling)")
+	flag.Int64Var(&eventsRetentionDays, "events-retention-days", resolveConfigInt64(cfgFile.EventsRetentionDays, "HDCF_EVENTS_RETENTION_DAYS", 30), "days to retain audit events")
+	flag.String("config", controlConfigPathFromArgs(), "path to control-plane JSON config file (defaults to HDCF_CONTROL_CONFIG)")
 	flag.Parse()
 	if strings.TrimSpace(cfg.adminToken) == "" {
 		cfg.adminToken = legacyToken
@@ -674,6 +722,74 @@ func parseConfig() controlConfig {
 		log.Fatalf("tls-client-ca is required when tls-require-client-cert is enabled")
 	}
 	return cfg
+}
+
+func controlConfigPathFromArgs() string {
+	path := strings.TrimSpace(os.Getenv("HDCF_CONTROL_CONFIG"))
+	for i := 1; i < len(os.Args); i++ {
+		arg := strings.TrimSpace(os.Args[i])
+		switch {
+		case arg == "-config":
+			if i+1 < len(os.Args) {
+				path = strings.TrimSpace(os.Args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "-config="):
+			path = strings.TrimSpace(strings.TrimPrefix(arg, "-config="))
+		case arg == "--config":
+			if i+1 < len(os.Args) {
+				path = strings.TrimSpace(os.Args[i+1])
+				i++
+			}
+		case strings.HasPrefix(arg, "--config="):
+			path = strings.TrimSpace(strings.TrimPrefix(arg, "--config="))
+		}
+	}
+	return path
+}
+
+func controlLoadConfig(path string) controlConfigFile {
+	if strings.TrimSpace(path) == "" {
+		return controlConfigFile{}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("read control config: %v", err)
+	}
+	var cfg controlConfigFile
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		log.Fatalf("parse control config: %v", err)
+	}
+	return cfg
+}
+
+func resolveConfigString(raw *string, envName, fallback string) string {
+	if raw != nil && strings.TrimSpace(*raw) != "" {
+		return strings.TrimSpace(*raw)
+	}
+	return getenvDefault(envName, fallback)
+}
+
+func resolveConfigInt64(raw *int64, envName string, fallback int64) int64 {
+	if raw != nil {
+		return *raw
+	}
+	return getenvInt(envName, fallback)
+}
+
+func resolveConfigBool(raw *bool, envName string, fallback bool) bool {
+	if raw != nil {
+		return *raw
+	}
+	envRaw := strings.TrimSpace(os.Getenv(envName))
+	if envRaw == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(envRaw)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func getenvDefault(name, fallback string) string {
@@ -1090,6 +1206,85 @@ func listEvents(s *store.Store) http.HandlerFunc {
 			"limit":       limit,
 		})
 		writeJSON(w, http.StatusOK, events)
+	}
+}
+
+func healthzHandler(s *store.Store, dbPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		requestID := requestIDFromHTTP(r)
+		ctx := store.WithRequestID(r.Context(), requestID)
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+
+		checkedAt := time.Now().Format(time.RFC3339Nano)
+		checks := map[string]map[string]any{}
+		overall := "ok"
+
+		diag, err := s.MigrationDiagnostics(ctx)
+		dbCheck := map[string]any{
+			"status": "ok",
+			"diagnostics": diag,
+		}
+		if err != nil {
+			dbCheck["status"] = "unhealthy"
+			dbCheck["error"] = err.Error()
+			overall = "degraded"
+		} else if !diag.Healthy {
+			dbCheck["status"] = "degraded"
+			overall = "degraded"
+		}
+		checks["db"] = dbCheck
+
+		fsCheck := map[string]any{
+			"path": dbPath,
+		}
+		if strings.TrimSpace(dbPath) == "" || strings.TrimSpace(dbPath) == ":memory:" {
+			fsCheck["status"] = "ok"
+			fsCheck["type"] = "memory"
+		} else {
+			dbDir := filepath.Dir(dbPath)
+			if strings.TrimSpace(dbDir) == "" {
+				dbDir = "."
+			}
+			tmp, err := os.CreateTemp(dbDir, ".hdcf-healthcheck-*")
+			if err != nil {
+				fsCheck["status"] = "unhealthy"
+				fsCheck["error"] = err.Error()
+				overall = "degraded"
+			} else {
+				path := tmp.Name()
+				if err := tmp.Close(); err != nil {
+					fsCheck["status"] = "unhealthy"
+					fsCheck["error"] = err.Error()
+					_ = os.Remove(path)
+					overall = "degraded"
+				} else if err := os.Remove(path); err != nil {
+					fsCheck["status"] = "degraded"
+					fsCheck["error"] = err.Error()
+					overall = "degraded"
+				} else {
+					fsCheck["status"] = "ok"
+					fsCheck["directory"] = dbDir
+				}
+			}
+		}
+		checks["filesystem"] = fsCheck
+
+		resp := controlHealthCheck{
+			Status:  overall,
+			Checked: checkedAt,
+			Checks: map[string]map[string]any{
+				"db":         checks["db"],
+				"filesystem": checks["filesystem"],
+			},
+		}
+		if overall == "ok" {
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, resp)
 	}
 }
 
