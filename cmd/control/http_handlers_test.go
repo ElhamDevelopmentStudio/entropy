@@ -1,9 +1,9 @@
 package main
 
-	import (
-		"bytes"
-		"encoding/json"
-		"io"
+import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -46,8 +46,8 @@ func newControlHarness(t *testing.T) *controlHarness {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ui", dashboardUI())
-	mux.HandleFunc("/ui/", dashboardUI())
+	mux.HandleFunc("/ui", withAdminAuth(cfg, dashboardUI()))
+	mux.HandleFunc("/ui/", withAdminAuth(cfg, dashboardUI()))
 	mux.HandleFunc("/healthz", healthzHandler(s, dbPath))
 	mux.HandleFunc("/jobs", withAdminAuth(cfg, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAdminAuth(cfg, getJobHandler(s)))
@@ -166,7 +166,7 @@ func TestControlWorkerLifecycleCompleteAndDuplicateCompletion(t *testing.T) {
 	h := newControlHarness(t)
 
 	resp, raw := h.doJSON(t, http.MethodPost, "/register", controlWorkerToken, map[string]any{
-		"worker_id":   "worker-a",
+		"worker_id":    "worker-a",
 		"capabilities": []string{"linux"},
 	})
 	if resp.StatusCode != http.StatusOK {
@@ -177,12 +177,12 @@ func TestControlWorkerLifecycleCompleteAndDuplicateCompletion(t *testing.T) {
 		"command":      "echo",
 		"args":         []string{"done"},
 		"max_attempts": 2,
-		"requirements":  []string{"linux"},
-		"needs_gpu":     false,
-		"priority":      10,
-		"scheduled_at":  0,
-		"timeout_ms":    1000,
-		"working_dir":   "",
+		"requirements": []string{"linux"},
+		"needs_gpu":    false,
+		"priority":     10,
+		"scheduled_at": 0,
+		"timeout_ms":   1000,
+		"working_dir":  "",
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create job failed: %d body=%s", resp.StatusCode, string(raw))
@@ -223,19 +223,19 @@ func TestControlWorkerLifecycleCompleteAndDuplicateCompletion(t *testing.T) {
 	}
 
 	resp, raw = h.doJSON(t, http.MethodPost, "/complete", controlWorkerToken, hdcf.CompleteRequest{
-		JobID:          assigned.JobID,
-		WorkerID:       "worker-a",
-		AssignmentID:    assigned.AssignmentID,
-		ArtifactID:      "artifact-1",
-		ExitCode:       0,
-		StdoutPath:      "/tmp/worker.out",
-		StderrPath:      "/tmp/worker.err",
-		StdoutTmpPath:   "/tmp/worker.out.tmp",
-		StderrTmpPath:   "/tmp/worker.err.tmp",
-		ArtifactBackend: hdcf.ArtifactStorageBackendLocal,
+		JobID:               assigned.JobID,
+		WorkerID:            "worker-a",
+		AssignmentID:        assigned.AssignmentID,
+		ArtifactID:          "artifact-1",
+		ExitCode:            0,
+		StdoutPath:          "/tmp/worker.out",
+		StderrPath:          "/tmp/worker.err",
+		StdoutTmpPath:       "/tmp/worker.out.tmp",
+		StderrTmpPath:       "/tmp/worker.err.tmp",
+		ArtifactBackend:     hdcf.ArtifactStorageBackendLocal,
 		ArtifactUploadState: hdcf.ArtifactUploadStateOK,
-		CompletionSeq:   1,
-		ResultSummary:   "unit complete",
+		CompletionSeq:       1,
+		ResultSummary:       "unit complete",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("complete failed: %d body=%s", resp.StatusCode, string(raw))
@@ -249,19 +249,19 @@ func TestControlWorkerLifecycleCompleteAndDuplicateCompletion(t *testing.T) {
 	}
 
 	resp, raw = h.doJSON(t, http.MethodPost, "/complete", controlWorkerToken, hdcf.CompleteRequest{
-		JobID:          assigned.JobID,
-		WorkerID:       "worker-a",
-		AssignmentID:    assigned.AssignmentID,
-		ArtifactID:      "artifact-1",
-		ExitCode:       0,
-		StdoutPath:      "/tmp/worker.out",
-		StderrPath:      "/tmp/worker.err",
-		StdoutTmpPath:   "/tmp/worker.out.tmp",
-		StderrTmpPath:   "/tmp/worker.err.tmp",
-		ArtifactBackend: hdcf.ArtifactStorageBackendLocal,
+		JobID:               assigned.JobID,
+		WorkerID:            "worker-a",
+		AssignmentID:        assigned.AssignmentID,
+		ArtifactID:          "artifact-1",
+		ExitCode:            0,
+		StdoutPath:          "/tmp/worker.out",
+		StderrPath:          "/tmp/worker.err",
+		StdoutTmpPath:       "/tmp/worker.out.tmp",
+		StderrTmpPath:       "/tmp/worker.err.tmp",
+		ArtifactBackend:     hdcf.ArtifactStorageBackendLocal,
 		ArtifactUploadState: hdcf.ArtifactUploadStateOK,
-		CompletionSeq:   0,
-		ResultSummary:   "duplicate",
+		CompletionSeq:       0,
+		ResultSummary:       "duplicate",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("duplicate complete should be idempotent: %d body=%s", resp.StatusCode, string(raw))
@@ -358,15 +358,15 @@ func TestControlAbortEndpoint(t *testing.T) {
 	}
 
 	resp, raw = h.doJSON(t, http.MethodPost, "/abort", controlAdminToken, hdcf.AbortRequest{
-		JobID: created.JobID,
+		JobID:  created.JobID,
 		Reason: "test abort",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("abort failed: %d body=%s", resp.StatusCode, string(raw))
 	}
 	var aborted struct {
-		Status    string `json:"status"`
-		Aborted   int64  `json:"aborted_jobs"`
+		Status  string `json:"status"`
+		Aborted int64  `json:"aborted_jobs"`
 	}
 	if err := json.Unmarshal(raw, &aborted); err != nil {
 		t.Fatalf("decode abort response: %v", err)
@@ -408,5 +408,20 @@ func TestControlEventsAndInvalidQueryHandling(t *testing.T) {
 	resp, raw = h.doJSON(t, http.MethodGet, "/events?limit=0", controlAdminToken, nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected bad request for invalid limit, got %d body=%s", resp.StatusCode, string(raw))
+	}
+}
+
+func TestControlUIRequiresAdminToken(t *testing.T) {
+	t.Parallel()
+	h := newControlHarness(t)
+
+	resp, _ := h.doJSON(t, http.MethodGet, "/ui", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected /ui to require admin token, got %d", resp.StatusCode)
+	}
+
+	resp, raw := h.doJSON(t, http.MethodGet, "/ui", controlAdminToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected /ui with admin token to return 200, got %d body=%s", resp.StatusCode, string(raw))
 	}
 }
