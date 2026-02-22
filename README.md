@@ -70,7 +70,11 @@ Tables:
 - `workers`:
   - `worker_id`, `last_seen`, `current_job_id`, `status`
 
-Current states in this MVP: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`.
+Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAILED`, `LOST`, `RETRYING`, `ABORTED` (SRS-complete core state machine is in place; advanced lifecycle transitions are being implemented by checklist).
+
+## SRS checklist
+
+- See `SRS_IMPLEMENTATION_CHECKLIST.md` for the full ordered implementation plan and progress tracking.
 
 ## Notes
 

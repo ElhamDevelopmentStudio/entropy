@@ -9,10 +9,62 @@ import (
 
 const (
 	StatusPending   = "PENDING"
+	StatusAssigned  = "ASSIGNED"
 	StatusRunning   = "RUNNING"
 	StatusCompleted = "COMPLETED"
 	StatusFailed    = "FAILED"
+	StatusLost      = "LOST"
+	StatusRetrying  = "RETRYING"
+	StatusAborted   = "ABORTED"
 )
+
+var validTransitions = map[string]map[string]bool{
+	StatusPending: {
+		StatusAssigned:  true,
+		StatusRunning:   true,
+		StatusFailed:    true,
+		StatusAborted:   true,
+		StatusRetrying:  true,
+	},
+	StatusAssigned: {
+		StatusRunning:  true,
+		StatusPending:  true,
+		StatusFailed:   true,
+		StatusAborted:  true,
+	},
+	StatusRunning: {
+		StatusCompleted: true,
+		StatusFailed:    true,
+		StatusLost:      true,
+		StatusAborted:   true,
+		StatusRetrying:  true,
+	},
+	StatusCompleted: {
+		StatusCompleted: true,
+	},
+	StatusFailed: {
+		StatusFailed:   true,
+		StatusPending:  true,
+		StatusRetrying: true,
+		StatusAborted:  true,
+	},
+	StatusLost: {
+		StatusPending:  true,
+		StatusRetrying: true,
+		StatusFailed:   true,
+		StatusAborted:  true,
+	},
+	StatusRetrying: {
+		StatusPending:   true,
+		StatusAssigned:  true,
+		StatusRunning:   true,
+		StatusAborted:   true,
+		StatusFailed:    true,
+	},
+	StatusAborted: {
+		StatusAborted: true,
+	},
+}
 
 type CreateJobRequest struct {
 	Command     string   `json:"command"`
@@ -71,6 +123,23 @@ type FailRequest struct {
 	WorkerID string `json:"worker_id"`
 	ExitCode int    `json:"exit_code"`
 	Error    string `json:"error"`
+}
+
+func IsValidStatus(status string) bool {
+	switch status {
+	case StatusPending, StatusAssigned, StatusRunning, StatusCompleted, StatusFailed, StatusLost, StatusRetrying, StatusAborted:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsValidTransition(from, to string) bool {
+	nexts, ok := validTransitions[from]
+	if !ok {
+		return false
+	}
+	return nexts[to]
 }
 
 func NewJobID() string {

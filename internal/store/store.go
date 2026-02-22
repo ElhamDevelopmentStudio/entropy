@@ -49,7 +49,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS jobs (
 		id TEXT PRIMARY KEY,
-		status TEXT NOT NULL,
+		status TEXT NOT NULL CHECK (status IN ('PENDING','ASSIGNED','RUNNING','COMPLETED','FAILED','LOST','RETRYING','ABORTED')),
 		command TEXT NOT NULL,
 		args TEXT NOT NULL,
 		working_dir TEXT,
@@ -115,6 +115,10 @@ func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.
 }
 
 func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.AssignedJob, bool, error) {
+	if !hdcf.IsValidTransition(hdcf.StatusPending, hdcf.StatusRunning) {
+		return nil, false, errors.New("invalid transition PENDING -> RUNNING")
+	}
+
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
 	})
@@ -233,6 +237,9 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	if status.String != hdcf.StatusRunning && status.String != hdcf.StatusPending {
 		return fmt.Errorf("job state not completable: %s", status.String)
 	}
+	if !hdcf.IsValidTransition(status.String, hdcf.StatusCompleted) {
+		return fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusCompleted)
+	}
 	if strings.TrimSpace(req.WorkerID) != "" && !workerID.Valid && status.String == hdcf.StatusPending {
 		return fmt.Errorf("job worker mismatch for completion")
 	}
@@ -282,6 +289,9 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 	}
 	if status.String != hdcf.StatusRunning && status.String != hdcf.StatusPending {
 		return fmt.Errorf("job state not fail-safe: %s", status.String)
+	}
+	if !hdcf.IsValidTransition(status.String, hdcf.StatusFailed) {
+		return fmt.Errorf("invalid transition %s -> %s", status.String, hdcf.StatusFailed)
 	}
 	if strings.TrimSpace(req.WorkerID) != "" && workerID.Valid && workerID.String != req.WorkerID {
 		return fmt.Errorf("job worker mismatch for failure")
