@@ -59,6 +59,8 @@ func (s *Store) initSchema(ctx context.Context) error {
 		attempt_count INTEGER NOT NULL DEFAULT 0,
 		max_attempts INTEGER NOT NULL DEFAULT 3,
 		worker_id TEXT,
+		assignment_id TEXT,
+		assignment_expires_at INTEGER,
 		last_error TEXT,
 		result_path TEXT,
 		updated_by TEXT
@@ -72,7 +74,52 @@ func (s *Store) initSchema(ctx context.Context) error {
 	);
 	`
 	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.ensureJobColumns(ctx)
+}
+
+func (s *Store) ensureJobColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(jobs)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	columns := map[string]struct{}{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	type columnDef struct {
+		name string
+		ddl  string
+	}
+	need := []columnDef{
+		{name: "assignment_id", ddl: "ALTER TABLE jobs ADD COLUMN assignment_id TEXT"},
+		{name: "assignment_expires_at", ddl: "ALTER TABLE jobs ADD COLUMN assignment_expires_at INTEGER"},
+	}
+	for _, col := range need {
+		if _, ok := columns[col.name]; ok {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.CreateJobResponse, error) {
@@ -115,8 +162,8 @@ func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.
 }
 
 func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.AssignedJob, bool, error) {
-	if !hdcf.IsValidTransition(hdcf.StatusPending, hdcf.StatusRunning) {
-		return nil, false, errors.New("invalid transition PENDING -> RUNNING")
+	if !hdcf.IsValidTransition(hdcf.StatusPending, hdcf.StatusAssigned) {
+		return nil, false, errors.New("invalid transition PENDING -> ASSIGNED")
 	}
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
@@ -128,6 +175,10 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 	defer tx.Rollback()
 
 	cutoff := time.Now().Unix() - int64(s.heartbeatTimeout.Seconds())
+	now := time.Now()
+	assignmentID := hdcf.NewJobID()
+	assignmentExpiresAt := now.Add(s.heartbeatTimeout).Unix()
+
 	row := tx.QueryRowContext(
 		ctx,
 		`SELECT id, command, args, working_dir, timeout_ms, attempt_count, max_attempts
@@ -164,9 +215,11 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 
 	res, err := tx.ExecContext(
 		ctx,
-		`UPDATE jobs SET status = ?, worker_id = ?, attempt_count = attempt_count + 1, updated_at = ?, updated_by = ? WHERE id = ? AND status = ?`,
-		hdcf.StatusRunning,
+		`UPDATE jobs SET status = ?, worker_id = ?, assignment_id = ?, assignment_expires_at = ?, attempt_count = attempt_count + 1, updated_at = ?, updated_by = ? WHERE id = ? AND status = ?`,
+		hdcf.StatusAssigned,
 		workerID,
+		assignmentID,
+		assignmentExpiresAt,
 		time.Now().Unix(),
 		workerID,
 		job.JobID,
@@ -183,10 +236,94 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 		return nil, false, nil
 	}
 	job.AttemptCount++
+	job.AssignmentID = assignmentID
+	job.AssignmentExpiresAt = assignmentExpiresAt
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
 	return &job, true, nil
+}
+
+func (s *Store) AcknowledgeJob(ctx context.Context, req hdcf.AckJobRequest) error {
+	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var status, workerID, assignmentID sql.NullString
+	var assignmentExpiresAt sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT status, worker_id, assignment_id, assignment_expires_at FROM jobs WHERE id = ?`, req.JobID).
+		Scan(&status, &workerID, &assignmentID, &assignmentExpiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("job not found")
+		}
+		return err
+	}
+
+	if status.String == hdcf.StatusCompleted {
+		return tx.Commit()
+	}
+	if status.String == hdcf.StatusRunning {
+		if strings.TrimSpace(req.WorkerID) == "" {
+			return fmt.Errorf("worker_id required")
+		}
+		if workerID.Valid && workerID.String != req.WorkerID {
+			return fmt.Errorf("job worker mismatch for ack")
+		}
+		if !assignmentID.Valid || assignmentID.String == "" {
+			return fmt.Errorf("assignment not expected")
+		}
+		if strings.TrimSpace(req.AssignmentID) == "" {
+			return fmt.Errorf("assignment_id required")
+		}
+		if assignmentID.String != req.AssignmentID {
+			return fmt.Errorf("assignment_id mismatch")
+		}
+		return tx.Commit()
+	}
+	if status.String != hdcf.StatusAssigned {
+		return fmt.Errorf("job state not ackable: %s", status.String)
+	}
+	if strings.TrimSpace(req.WorkerID) == "" {
+		return fmt.Errorf("worker_id required")
+	}
+	if strings.TrimSpace(req.AssignmentID) == "" {
+		return fmt.Errorf("assignment_id required")
+	}
+	if workerID.Valid && workerID.String != req.WorkerID {
+		return fmt.Errorf("job worker mismatch for ack")
+	}
+	if !assignmentID.Valid || assignmentID.String == "" {
+		return fmt.Errorf("assignment_id mismatch")
+	}
+	if assignmentID.String != req.AssignmentID {
+		return fmt.Errorf("assignment_id mismatch")
+	}
+	if assignmentExpiresAt.Valid && assignmentExpiresAt.Int64 > 0 && assignmentExpiresAt.Int64 < now {
+		return fmt.Errorf("assignment expired")
+	}
+	if !hdcf.IsValidTransition(hdcf.StatusAssigned, hdcf.StatusRunning) {
+		return fmt.Errorf("invalid transition %s -> %s", hdcf.StatusAssigned, hdcf.StatusRunning)
+	}
+
+	_, err = tx.ExecContext(
+		ctx,
+		`UPDATE jobs SET status = ?, updated_at = ?, updated_by = ? WHERE id = ? AND status = ?`,
+		hdcf.StatusRunning,
+		now,
+		req.WorkerID,
+		req.JobID,
+		hdcf.StatusAssigned,
+	)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RecordHeartbeat(ctx context.Context, req hdcf.HeartbeatRequest) error {
@@ -234,7 +371,7 @@ func (s *Store) CompleteJob(ctx context.Context, req hdcf.CompleteRequest) error
 	if status.String == hdcf.StatusCompleted {
 		return tx.Commit()
 	}
-	if status.String != hdcf.StatusRunning && status.String != hdcf.StatusPending {
+	if status.String != hdcf.StatusRunning {
 		return fmt.Errorf("job state not completable: %s", status.String)
 	}
 	if !hdcf.IsValidTransition(status.String, hdcf.StatusCompleted) {
@@ -287,7 +424,7 @@ func (s *Store) FailJob(ctx context.Context, req hdcf.FailRequest) error {
 	if status.String == hdcf.StatusFailed {
 		return tx.Commit()
 	}
-	if status.String != hdcf.StatusRunning && status.String != hdcf.StatusPending {
+	if status.String != hdcf.StatusRunning {
 		return fmt.Errorf("job state not fail-safe: %s", status.String)
 	}
 	if !hdcf.IsValidTransition(status.String, hdcf.StatusFailed) {
@@ -340,15 +477,35 @@ func (s *Store) RecoverStaleWorkers(ctx context.Context) error {
 		ctx,
 		`UPDATE jobs
 		 SET status = 'PENDING',
-		     worker_id = worker_id,
+		     worker_id = NULL,
+		     assignment_id = NULL,
+		     assignment_expires_at = NULL,
 		     updated_at = ?
 		 WHERE status = 'RUNNING'
 		   AND worker_id IN (
-			 SELECT worker_id FROM workers WHERE status = 'OFFLINE'
+		     SELECT worker_id FROM workers WHERE status = 'OFFLINE'
 		   )`,
 		now,
 	); err != nil {
 		return err
 	}
+
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE jobs
+		 SET status = 'PENDING',
+		     worker_id = NULL,
+		     assignment_id = NULL,
+		     assignment_expires_at = NULL,
+		     updated_at = ?
+		 WHERE status = 'ASSIGNED'
+		   AND assignment_expires_at IS NOT NULL
+		   AND assignment_expires_at < ?`,
+		now,
+		now - int64(s.heartbeatTimeout.Seconds()),
+	); err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }

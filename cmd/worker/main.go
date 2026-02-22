@@ -125,6 +125,12 @@ func (r *workerRunner) loop(ctx context.Context) {
 			backoff = r.pollInterval
 			continue
 		}
+		if err := r.ackJob(ctx, job); err != nil {
+			log.Printf("ack-job %s: %v", job.JobID, err)
+			time.Sleep(backoff)
+			backoff = nextBackoff(backoff, 30*time.Second)
+			continue
+		}
 
 		r.currentJobID.Store(job.JobID)
 		r.executeJob(ctx, job)
@@ -197,6 +203,19 @@ func (r *workerRunner) nextJob(ctx context.Context) (*hdcf.AssignedJob, error) {
 		return nil, err
 	}
 	return &job, nil
+}
+
+func (r *workerRunner) ackJob(ctx context.Context, job *hdcf.AssignedJob) error {
+	req := hdcf.AckJobRequest{
+		JobID:        job.JobID,
+		WorkerID:     r.workerID,
+		AssignmentID: job.AssignmentID,
+	}
+	payload, _ := json.Marshal(req)
+	endpoint := fmt.Sprintf("%s/ack", r.controlURL)
+	return retryWithBackoff(ctx, r.requestTimeout, func() error {
+		return r.postJSON(ctx, endpoint, payload)
+	}, 8)
 }
 
 func (r *workerRunner) sendHeartbeat(ctx context.Context, currentJobID *string) error {

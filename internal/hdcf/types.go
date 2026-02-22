@@ -101,12 +101,21 @@ type AssignedJob struct {
 	TimeoutMs   int64    `json:"timeout_ms"`
 	AttemptCount int     `json:"attempt_count"`
 	MaxAttempts int      `json:"max_attempts"`
+	AssignmentID string  `json:"assignment_id"`
+	// Unix timestamp in seconds. If empty/zero, caller should treat as immediate expiry.
+	AssignmentExpiresAt int64 `json:"assignment_expires_at"`
 }
 
 type HeartbeatRequest struct {
 	WorkerID     string  `json:"worker_id"`
 	CurrentJobID *string `json:"current_job_id"`
 	Timestamp    string  `json:"ts"`
+}
+
+type AckJobRequest struct {
+	JobID        string `json:"job_id"`
+	WorkerID     string `json:"worker_id"`
+	AssignmentID string `json:"assignment_id"`
 }
 
 type CompleteRequest struct {

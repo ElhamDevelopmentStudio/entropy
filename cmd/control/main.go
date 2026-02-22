@@ -34,6 +34,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jobs", withAuth(cfg.apiToken, createJob(s)))
 	mux.HandleFunc("/next-job", withAuth(cfg.apiToken, nextJob(s)))
+	mux.HandleFunc("/ack", withAuth(cfg.apiToken, ackJob(s)))
 	mux.HandleFunc("/heartbeat", withAuth(cfg.apiToken, heartbeat(s)))
 	mux.HandleFunc("/complete", withAuth(cfg.apiToken, completeJob(s)))
 	mux.HandleFunc("/fail", withAuth(cfg.apiToken, failJob(s)))
@@ -136,6 +137,28 @@ func nextJob(s *store.Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, job)
+	}
+}
+
+func ackJob(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		var req hdcf.AckJobRequest
+		if err := decodeJSON(w, r, &req); err != nil {
+			return
+		}
+		if strings.TrimSpace(req.JobID) == "" || strings.TrimSpace(req.WorkerID) == "" || strings.TrimSpace(req.AssignmentID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "job_id, worker_id, and assignment_id required"})
+			return
+		}
+		if err := s.AcknowledgeJob(r.Context(), req); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "job_id": req.JobID})
 	}
 }
 

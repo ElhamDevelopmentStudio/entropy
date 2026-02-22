@@ -56,9 +56,17 @@ The CLI sends `POST /jobs` and returns the new `job_id`.
 
 - `POST /jobs`
 - `GET /next-job?worker_id=...`
+- `POST /ack`
 - `POST /heartbeat`
 - `POST /complete`
 - `POST /fail`
+
+ACK flow behavior:
+
+- `/next-job` transitions a claimed job to `ASSIGNED` and returns `assignment_id` plus `assignment_expires_at` (Unix epoch seconds).
+- Worker must call `/ack` before executing with `job_id`, `worker_id`, and `assignment_id`.
+- `/ack` transitions job from `ASSIGNED` to `RUNNING`.
+- Reconciler returns stale assignments (`ASSIGNED` with expired `assignment_expires_at`) to `PENDING`.
 
 ## Data model
 
@@ -66,7 +74,7 @@ Tables:
 
 - `jobs`:
   - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `created_at`, `updated_at`,
-    `attempt_count`, `max_attempts`, `worker_id`, `last_error`, `result_path`, `updated_by`
+    `attempt_count`, `max_attempts`, `worker_id`, `assignment_id`, `assignment_expires_at`, `last_error`, `result_path`, `updated_by`
 - `workers`:
   - `worker_id`, `last_seen`, `current_job_id`, `status`
 

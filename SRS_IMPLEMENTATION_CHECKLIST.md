@@ -31,8 +31,6 @@ Basic CLI enqueue helper
 Static token auth via `X-API-Token`
 
 Not yet implemented from SRS:
-Full state machine (`ASSIGNED`, `LOST`, `RETRYING`, `ABORTED`)
-Explicit assignment ACK protocol
 Duplicate completion safety and reconciliation protocol
 Worker registration/reconnect semantics
 Artifact integrity + atomic completion guarantee
@@ -68,7 +66,7 @@ Any job state change persists atomically in SQLite.
 No SQL path writes invalid terminal state transitions.
 Dependency: none.
 
-2. `[ ]` P1-02 — Implement explicit assignment handshake with ACK timeout
+2. `[x]` P1-02 — Implement explicit assignment handshake with ACK timeout
 Requirement source: `SRS.md` Section 4.1.2
 Target: `cmd/control/main.go`, `cmd/worker/main.go`, `internal/store/store.go`
 Implementation details:
