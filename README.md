@@ -178,6 +178,11 @@ Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAIL
 - Section 7 scenarios from `SRS.md` are documented in `SRS_TEST_SCENARIOS.md`.
 - A helper script exists at `scripts/reliability-scenarios.sh` for scenario status checks and duplicate-completion replay.
 
+## UI
+
+- Open `http://<control-plane>/ui` for a lightweight dashboard.
+- The dashboard is unauthenticated for page load, but you must provide the `X-API-Token` value in the page input to call APIs.
+
 ## Notes
 
 - Jobs are claimed by polling, never pushed.

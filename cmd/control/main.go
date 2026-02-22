@@ -52,6 +52,8 @@ func main() {
 	go runReconciler(ctx, s, cfg.reconcileInterval)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/ui", dashboardUI())
+	mux.HandleFunc("/ui/", dashboardUI())
 	mux.HandleFunc("/jobs", withAuth(cfg.apiToken, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAuth(cfg.apiToken, getJobHandler(s)))
 	mux.HandleFunc("/register", withAuth(cfg.apiToken, registerWorker(s)))
@@ -74,6 +76,472 @@ func main() {
 		log.Fatalf("http server exited: %v", err)
 	}
 }
+
+func dashboardUI() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ui" && r.URL.Path != "/ui/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(dashboardHTML))
+	}
+}
+
+const dashboardHTML = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HDCF Dashboard</title>
+    <style>
+      :root {
+        --bg: #0e1424;
+        --panel: #1a2340;
+        --panel-2: #243059;
+        --text: #edf2ff;
+        --muted: #96a0bf;
+        --ok: #38c172;
+        --warn: #f59f00;
+        --bad: #f06548;
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        color: var(--text);
+        background: linear-gradient(145deg, #0a0f1f, #101f3d);
+      }
+      .page {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .grid {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: 1fr;
+      }
+      .card {
+        background: linear-gradient(180deg, var(--panel), var(--panel-2));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 14px;
+        box-shadow: 0 12px 26px rgba(0,0,0,0.2);
+      }
+      h1, h2 {
+        margin: 0 0 10px 0;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      input, select, button {
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 8px;
+        padding: 8px 10px;
+        background: #141c35;
+        color: var(--text);
+      }
+      button {
+        cursor: pointer;
+      }
+      button.warn { background: #6b1f1a; border-color: #9f2e1c; }
+      button:disabled { opacity: .5; cursor: not-allowed; }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+      }
+      th, td {
+        border-bottom: 1px solid rgba(255,255,255,0.09);
+        text-align: left;
+        font-size: 13px;
+        padding: 8px;
+        vertical-align: top;
+      }
+      th {
+        color: #cbd4f0;
+        font-weight: 600;
+      }
+      .pill {
+        display: inline-block;
+        border-radius: 999px;
+        padding: 2px 8px;
+        border: 1px solid rgba(255,255,255,0.2);
+        font-size: 12px;
+      }
+      .pill.ok { background: rgba(56,193,114,0.18); color: #a8f7c4; }
+      .pill.warn { background: rgba(245,159,0,0.18); color: #ffe6b3; }
+      .pill.bad { background: rgba(240,101,72,0.22); color: #ffd3c8; }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .help {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .flex {
+        display: flex;
+      }
+      .flex-grow { flex: 1; }
+      #status {
+        margin-left: 10px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .small {
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="grid">
+        <section class="card">
+          <h1>HDCF Dashboard</h1>
+          <div class="row">
+            <label>
+              API Token
+              <input id="token" type="password" placeholder="X-API-Token" value="" />
+            </label>
+            <label>
+              Job status
+              <select id="jobStatus">
+                <option value="">All</option>
+                <option value="PENDING">PENDING</option>
+                <option value="ASSIGNED">ASSIGNED</option>
+                <option value="RUNNING">RUNNING</option>
+                <option value="COMPLETED">COMPLETED</option>
+                <option value="FAILED">FAILED</option>
+                <option value="LOST">LOST</option>
+                <option value="RETRYING">RETRYING</option>
+                <option value="ABORTED">ABORTED</option>
+              </select>
+            </label>
+            <label>
+              Refresh (ms)
+              <select id="refreshMs">
+                <option value="1000">1000</option>
+                <option value="2000">2000</option>
+                <option value="3000" selected>3000</option>
+                <option value="5000">5000</option>
+              </select>
+            </label>
+            <button id="saveToken">Save</button>
+            <button id="refreshNow">Refresh now</button>
+          </div>
+          <div class="row">
+            <div id="status" class="help">waiting for auth...</div>
+            <div id="nextRefresh" class="help"></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <h2>Jobs</h2>
+          </div>
+          <div id="jobsError" class="small help"></div>
+          <table>
+            <thead>
+              <tr>
+                <th>Job ID</th>
+                <th>Status</th>
+                <th>Command</th>
+                <th>Worker / Assoc</th>
+                <th>Attempts</th>
+                <th>Updated</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="jobsRows"></tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <h2>Workers</h2>
+          <div id="workersError" class="small help"></div>
+          <table>
+            <thead>
+              <tr>
+                <th>Worker ID</th>
+                <th>Status</th>
+                <th>Current Job</th>
+                <th>Heartbeat Age</th>
+                <th>Capabilities</th>
+                <th>Metrics</th>
+              </tr>
+            </thead>
+            <tbody id="workersRows"></tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <h2>Recent Events</h2>
+          <div id="eventsError" class="small help"></div>
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Component</th>
+                <th>Event</th>
+                <th>Level</th>
+                <th>Job / Worker</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody id="eventsRows"></tbody>
+          </table>
+        </section>
+      </div>
+    </div>
+    <script>
+      const STORAGE_KEY = 'hdcf-ui-token';
+      const tokenInput = document.getElementById('token');
+      const jobStatus = document.getElementById('jobStatus');
+      const refreshMs = document.getElementById('refreshMs');
+      const statusEl = document.getElementById('status');
+      const nextRefreshEl = document.getElementById('nextRefresh');
+      const jobsRows = document.getElementById('jobsRows');
+      const workersRows = document.getElementById('workersRows');
+      const eventsRows = document.getElementById('eventsRows');
+      const jobsError = document.getElementById('jobsError');
+      const workersError = document.getElementById('workersError');
+      const eventsError = document.getElementById('eventsError');
+      let timer = null;
+
+      function state() {
+        return {
+          token: tokenInput.value.trim() || localStorage.getItem(STORAGE_KEY) || '',
+          statusFilter: jobStatus.value
+        };
+      }
+
+      function apiHeaders() {
+        const token = state().token;
+        if (!token) return null;
+        return {
+          'Content-Type': 'application/json',
+          'X-API-Token': token
+        };
+      }
+
+      async function callApi(path, init = {}) {
+        const headers = apiHeaders() || {'Content-Type': 'application/json'};
+        const res = await fetch(path, {
+          ...init,
+          headers: {
+            ...headers,
+            ...(init.headers || {}),
+          },
+        });
+        const text = await res.text();
+        let payload = null;
+        try { payload = text ? JSON.parse(text) : null; } catch (_) {}
+        return { ok: res.ok, status: res.status, payload, raw: text };
+      }
+
+      function formatEpoch(sec) {
+        if (!sec && sec !== 0) return '';
+        const d = new Date((Number(sec) || 0) * 1000);
+        return d.toLocaleString();
+      }
+
+      function formatAge(sec) {
+        if (sec == null) return 'n/a';
+        return `${sec}s`;
+      }
+
+      function shortId(id) {
+        if (!id) return '';
+        return id.length > 10 ? id.slice(0, 8) + '…' : id;
+      }
+
+      function pillClass(status) {
+        switch (status) {
+          case 'COMPLETED': return 'ok';
+          case 'RUNNING':
+          case 'ASSIGNED': return 'warn';
+          case 'FAILED':
+          case 'ABORTED':
+          case 'LOST': return 'bad';
+          default: return '';
+        }
+      }
+
+      function statusText(j) {
+        if (!j.status) return '';
+        const age = j.heartbeat_age_sec == null ? '' : `, heartbeat ${formatAge(j.heartbeat_age_sec)}`;
+        return `${j.status}${age}`;
+      }
+
+      function metricsText(metrics) {
+        const parts = [];
+        if (metrics.cpu_usage_percent != null) {
+          parts.push(`CPU: ${Number(metrics.cpu_usage_percent).toFixed(1)}%`);
+        }
+        if (metrics.memory_usage_mb != null) {
+          parts.push(`RAM: ${Number(metrics.memory_usage_mb).toFixed(1)}MB`);
+        }
+        if (metrics.gpu_usage_percent != null) {
+          parts.push(`GPU: ${Number(metrics.gpu_usage_percent).toFixed(1)}%`);
+        }
+        if (metrics.gpu_memory_usage_mb != null) {
+          parts.push(`VRAM: ${Number(metrics.gpu_memory_usage_mb).toFixed(1)}MB`);
+        }
+        return parts.length === 0 ? '-' : parts.join(' • ');
+      }
+
+      function renderJobs(jobs) {
+        jobsRows.innerHTML = jobs.map(j => {
+          const terminal = ['COMPLETED', 'FAILED', 'ABORTED'].includes(j.status);
+          const action = terminal ? '' : `<button class="warn" onclick="abortJob('${j.job_id}')">Abort</button>`;
+          const assignment = j.assignment_id ? shortId(j.assignment_id) : '';
+          return `<tr>
+            <td class="mono">${shortId(j.job_id)}</td>
+            <td><span class="pill ${pillClass(j.status)}">${statusText(j)}</span></td>
+            <td><div>${j.command}</div><div class="small mono">${(j.args || []).join(' ')}</div></td>
+            <td class="small mono">${j.worker_id || '-'} ${assignment ? `<span>/ ${assignment}</span>` : ''}</td>
+            <td>${j.attempt_count}/${j.max_attempts}</td>
+            <td><div>${formatEpoch(j.updated_at)}</div><div class="small">${j.last_error ? ('err: ' + j.last_error) : ''}</div></td>
+            <td>${action}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      function renderWorkers(workers) {
+        workersRows.innerHTML = workers.map(w => {
+          const metrics = w.heartbeat_metrics || {};
+          return `<tr>
+            <td class="mono">${w.worker_id}</td>
+            <td class="pill ${w.status === 'ONLINE' ? 'ok' : 'bad'}">${w.status}</td>
+            <td class="mono">${w.current_job_id || '-'}</td>
+            <td>${w.heartbeat_age_sec == null ? 'n/a' : formatAge(w.heartbeat_age_sec)}</td>
+            <td class="small mono">${(w.capabilities || []).join(', ') || '-'}</td>
+            <td class="small mono">${metricsText(metrics)}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      function renderEvents(events) {
+        eventsRows.innerHTML = events.map(ev => {
+          const details = ev.details ? JSON.stringify(ev.details) : '';
+          return `<tr>
+            <td>${formatEpoch(ev.ts)}</td>
+            <td>${ev.component || ''}</td>
+            <td>${ev.event || ''}</td>
+            <td>${ev.level || ''}</td>
+            <td class="small mono">${ev.job_id ? ev.job_id : ''} ${ev.worker_id ? `/ ${ev.worker_id}` : ''}</td>
+            <td class="small mono">${details}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      async function abortJob(jobId) {
+        if (!jobId) return;
+        const token = state().token;
+        if (!token) {
+          setStatus('save token first');
+          return;
+        }
+        const resp = await callApi('/abort', {
+          method: 'POST',
+          body: JSON.stringify({ job_id: jobId })
+        });
+        if (!resp.ok) {
+          alert('Abort failed: ' + (resp.raw || 'error'));
+          return;
+        }
+        await refreshAll();
+      }
+
+      function setStatus(msg) {
+        statusEl.textContent = msg;
+      }
+
+      async function refreshAll() {
+        if (!state().token) {
+          setStatus('set token to query API');
+          return;
+        }
+        const filters = state().statusFilter ? `?status=${encodeURIComponent(state().statusFilter)}` : '';
+        const [jobsResp, workersResp, eventsResp] = await Promise.all([
+          callApi(`/jobs${filters}`),
+          callApi('/workers'),
+          callApi('/events?limit=20')
+        ]);
+
+        jobsError.textContent = workersError.textContent = eventsError.textContent = '';
+        let allOk = true;
+
+        if (!jobsResp.ok) {
+          allOk = false;
+          jobsError.textContent = `jobs: ${jobsResp.status} ${jobsResp.raw || ''}`;
+        } else {
+          renderJobs(jobsResp.payload || []);
+        }
+
+        if (!workersResp.ok) {
+          allOk = false;
+          workersError.textContent = `workers: ${workersResp.status} ${workersResp.raw || ''}`;
+        } else {
+          renderWorkers(workersResp.payload || []);
+        }
+
+        if (!eventsResp.ok) {
+          allOk = false;
+          eventsError.textContent = `events: ${eventsResp.status} ${eventsResp.raw || ''}`;
+        } else {
+          renderEvents(eventsResp.payload || []);
+        }
+
+        setStatus(allOk ? `last refresh ${new Date().toLocaleTimeString()}` : 'refresh errors');
+      }
+
+      function startTicker() {
+        if (timer) clearInterval(timer);
+        const interval = Number(refreshMs.value || 3000);
+        timer = setInterval(async () => {
+          const next = Number(interval) / 1000;
+          nextRefreshEl.textContent = `next in ${next.toFixed(1)}s`;
+          await refreshAll();
+        }, interval);
+      }
+
+      async function onSaveToken() {
+        localStorage.setItem(STORAGE_KEY, tokenInput.value.trim());
+        setStatus('token saved');
+        await refreshAll();
+      }
+
+      async function init() {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) tokenInput.value = saved;
+        setStatus('ready');
+        document.getElementById('saveToken').addEventListener('click', onSaveToken);
+        document.getElementById('refreshNow').addEventListener('click', refreshAll);
+        refreshMs.addEventListener('change', startTicker);
+        jobStatus.addEventListener('change', refreshAll);
+        setInterval(() => {
+          const next = Number(refreshMs.value || 3000) / 1000;
+          nextRefreshEl.textContent = `next in ${next.toFixed(1)}s`;
+        }, 1000);
+        startTicker();
+        await refreshAll();
+      }
+
+      init();
+    </script>
+  </body>
+</html>`
 
 type controlConfig struct {
 	addr               string

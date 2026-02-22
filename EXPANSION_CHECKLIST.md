@@ -18,7 +18,7 @@ Source references:
 
 ## Expansion priority list
 
-1. `[ ]` P5-01 — Minimal dashboard UI for queue/worker observability
+1. `[x]` P5-01 — Minimal dashboard UI for queue/worker observability
 Requirement source: `SRS.md` operational visibility and optional MVP dashboard
 Target: new `web/` or `cmd/dashboard` (static UI + backend read endpoints)
 Implementation tasks:
@@ -29,6 +29,10 @@ Acceptance criteria:
 - Operators can inspect all jobs and workers without shelling into DB/curl.
 - UI reflects state changes within 1–3 seconds.
 Dependency: `GET /jobs`, `GET /jobs/{id}`, `GET /workers`, `GET /events`.
+Progress:
+- Added `/ui` minimal dashboard to control plane, served directly by `cmd/control/main.go`.
+- Dashboard renders live job list, worker list, and recent events with polling and optional filtering.
+- Added manual abort action in the UI and API-token persistence in browser local storage.
 
 2. `[ ]` P5-02 — Policy/retention engine for logs and artifacts
 Current status: no background lifecycle management yet
@@ -173,4 +177,3 @@ Execute these after the existing `P4-*` roadmap, then rotate in:
 1) UI/observability items,
 2) security and auth hardening,
 3) retention/compliance and operational reliability polish.
-
