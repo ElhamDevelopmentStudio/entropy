@@ -92,6 +92,7 @@ func TestControlWorkerSignedTokenValidation(t *testing.T) {
 	t.Parallel()
 	cfg := &controlConfig{
 		workerTokenSecret: "unit-secret",
+		workerToken:       "",
 	}
 	now := time.Now().Unix()
 	rawPayload := fmt.Sprintf("%s|%d|%s", "worker-1", now+30, hdcf.NewJobID())
@@ -133,7 +134,7 @@ func TestParseWorkerSignedTokenValidation(t *testing.T) {
 func TestBuildControlTLSConfigValidation(t *testing.T) {
 	t.Parallel()
 	_, err := buildControlTLSConfig(controlConfig{
-		tlsClientCA:         "",
+		tlsClientCA:          "",
 		tlsRequireClientCert: true,
 	})
 	if err == nil {
@@ -154,15 +155,28 @@ func TestBuildControlTLSConfigValidation(t *testing.T) {
 func TestResolveTokenFallbacks(t *testing.T) {
 	t.Parallel()
 	cfg := &controlConfig{
-		workerToken: "worker",
-		adminToken:  "admin",
+		workerToken:     "",
+		workerTokenPrev: "worker-prev",
+		adminToken:      "admin",
 	}
 	if got := cfg.authorizeWorkerRequest("", "w"); got == nil {
-		t.Fatal("expected empty token to be rejected")
+		t.Fatal("expected empty token to be rejected when worker static token missing")
 	}
-	cfg.workerToken = ""
-	if err := cfg.authorizeWorkerRequest("admin", "w"); err != nil {
-		t.Fatalf("expected admin token fallback for worker auth: %v", err)
+	if err := cfg.authorizeWorkerRequest("worker-prev", "w"); err != nil {
+		t.Fatalf("expected worker previous token to be accepted: %v", err)
+	}
+	if cfg.authorizeWorkerRequest("admin", "w") == nil {
+		t.Fatal("expected admin token to be rejected for worker auth without worker token fallback")
+	}
+	cfg = &controlConfig{
+		workerToken:       "",
+		workerTokenSecret: "secret",
+		adminToken:        "admin",
+	}
+	expiredPayload := fmt.Sprintf("%s|%d|%s", "w", time.Now().Unix()+30, hdcf.NewJobID())
+	validPayload := base64.RawURLEncoding.EncodeToString([]byte(expiredPayload))
+	if err := cfg.authorizeWorkerRequest("v1."+validPayload+"."+generateWorkerSignedTokenSig("secret", expiredPayload), "w"); err != nil {
+		t.Fatalf("expected signed token to be accepted without worker static token: %v", err)
 	}
 
 	if err := cfg.authorizeAdminRequest("admin"); err != nil {

@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -34,9 +34,9 @@ func main() {
 	ctx := context.Background()
 
 	s, err := store.Open(cfg.dbPath, cfg.heartbeatTimeout, store.StoreOptions{
-		QueueAgingWindowSeconds:           cfg.queueAgingWindowSeconds,
-		MaxConcurrentRetriesPerWorker:     cfg.maxConcurrentRetriesPerWorker,
-		PreemptBacklogThreshold:           cfg.preemptBacklogThreshold,
+		QueueAgingWindowSeconds:            cfg.queueAgingWindowSeconds,
+		MaxConcurrentRetriesPerWorker:      cfg.maxConcurrentRetriesPerWorker,
+		PreemptBacklogThreshold:            cfg.preemptBacklogThreshold,
 		PreemptHighPriorityMinimumPriority: cfg.preemptHighPriorityMinimumPriority,
 	})
 	if err != nil {
@@ -45,18 +45,18 @@ func main() {
 	defer s.Close()
 
 	auditEvent("info", "control.startup", "", map[string]any{
-		"addr":                         cfg.addr,
-		"db_path":                      cfg.dbPath,
+		"addr":                          cfg.addr,
+		"db_path":                       cfg.dbPath,
 		"heartbeat_timeout":             int(cfg.heartbeatTimeout.Seconds()),
-		"reconcile_interval":           int(cfg.reconcileInterval.Seconds()),
-		"cleanup_interval":             int(cfg.cleanupInterval.Seconds()),
-		"queue_aging_window_seconds":   cfg.queueAgingWindowSeconds,
-		"max_retry_per_worker":         cfg.maxConcurrentRetriesPerWorker,
-		"preempt_backlog_threshold":    cfg.preemptBacklogThreshold,
-		"preempt_priority_floor":       cfg.preemptHighPriorityMinimumPriority,
+		"reconcile_interval":            int(cfg.reconcileInterval.Seconds()),
+		"cleanup_interval":              int(cfg.cleanupInterval.Seconds()),
+		"queue_aging_window_seconds":    cfg.queueAgingWindowSeconds,
+		"max_retry_per_worker":          cfg.maxConcurrentRetriesPerWorker,
+		"preempt_backlog_threshold":     cfg.preemptBacklogThreshold,
+		"preempt_priority_floor":        cfg.preemptHighPriorityMinimumPriority,
 		"jobs_retention_completed_days": cfg.jobsRetentionCompletedDays,
 		"artifacts_retention_days":      cfg.artifactsRetentionDays,
-		"events_retention_days":          cfg.eventsRetentionDays,
+		"events_retention_days":         cfg.eventsRetentionDays,
 	})
 	recoverCtx := store.WithRequestID(ctx, hdcf.NewJobID())
 	if err := s.RecoverStaleWorkers(recoverCtx); err != nil {
@@ -73,8 +73,8 @@ func main() {
 	go runCleanup(ctx, s, cfg.cleanupInterval, cfg.jobsRetentionCompletedDays, cfg.artifactsRetentionDays, cfg.eventsRetentionDays)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ui", dashboardUI())
-	mux.HandleFunc("/ui/", dashboardUI())
+	mux.HandleFunc("/ui", withUIAuth(&cfg, dashboardUI()))
+	mux.HandleFunc("/ui/", withUIAuth(&cfg, dashboardUI()))
 	mux.HandleFunc("/healthz", healthzHandler(s, cfg.dbPath))
 	mux.HandleFunc("/jobs", withAdminAuth(&cfg, jobsHandler(s)))
 	mux.HandleFunc("/jobs/", withAdminAuth(&cfg, getJobHandler(s)))
@@ -111,7 +111,7 @@ func main() {
 		server.TLSConfig = tlsConfig
 		auditEvent("info", "control.listen", "", map[string]any{
 			"addr":     cfg.addr,
-		"protocol": "https",
+			"protocol": "https",
 		})
 		if err := server.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey); err != nil {
 			log.Fatalf("https server exited: %v", err)
@@ -135,7 +135,7 @@ func dashboardUI() http.HandlerFunc {
 	}
 }
 
-	const dashboardHTML = `<!doctype html>
+const dashboardHTML = `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -406,6 +406,16 @@ func dashboardUI() http.HandlerFunc {
         return sec + 's';
       }
 
+      function escapeHtml(value) {
+        return String(value == null ? '' : value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;')
+          .replaceAll(String.fromCharCode(96), '&#96;');
+      }
+
       function shortId(id) {
         if (!id) return '';
         return id.length > 10 ? id.slice(0, 8) + '…' : id;
@@ -449,17 +459,17 @@ func dashboardUI() http.HandlerFunc {
       function renderJobs(jobs) {
         jobsRows.innerHTML = jobs.map(j => {
           const terminal = ['COMPLETED', 'FAILED', 'ABORTED'].includes(j.status);
-          const action = terminal ? '' : '<button class="warn" onclick="abortJob(\'' + j.job_id + '\')">Abort</button>';
+          const action = terminal ? '' : '<button class="warn" data-job-id="' + escapeHtml(j.job_id) + '" onclick="abortJob(this.dataset.jobId)">Abort</button>';
           const assignment = j.assignment_id ? shortId(j.assignment_id) : '';
           const worker = j.worker_id || '-';
-          const workerCell = worker + (assignment ? ' <span>/ ' + assignment + '</span>' : '');
+          const workerCell = escapeHtml(worker) + (assignment ? ' <span>/ ' + escapeHtml(assignment) + '</span>' : '');
           return '<tr>' +
-            '<td class="mono">' + shortId(j.job_id) + '</td>' +
-            '<td><span class="pill ' + pillClass(j.status) + '">' + statusText(j) + '</span></td>' +
-            '<td><div>' + (j.command || '') + '</div><div class="small mono">' + ((j.args || []).join(' ')) + '</div></td>' +
+            '<td class="mono">' + escapeHtml(shortId(j.job_id)) + '</td>' +
+            '<td><span class="pill ' + pillClass(j.status) + '">' + escapeHtml(statusText(j)) + '</span></td>' +
+            '<td><div>' + escapeHtml(j.command || '') + '</div><div class="small mono">' + escapeHtml((j.args || []).join(' ')) + '</div></td>' +
             '<td class="small mono">' + workerCell + '</td>' +
-            '<td>' + j.attempt_count + '/' + j.max_attempts + '</td>' +
-            '<td><div>' + formatEpoch(j.updated_at) + '</div><div class="small">' + (j.last_error ? ('err: ' + j.last_error) : '') + '</div></td>' +
+            '<td>' + escapeHtml(j.attempt_count) + '/' + escapeHtml(j.max_attempts) + '</td>' +
+            '<td><div>' + formatEpoch(j.updated_at) + '</div><div class="small">' + escapeHtml(j.last_error ? ('err: ' + j.last_error) : '') + '</div></td>' +
             '<td>' + action + '</td>' +
           '</tr>';
         }).join('');
@@ -469,12 +479,12 @@ func dashboardUI() http.HandlerFunc {
         workersRows.innerHTML = workers.map(w => {
           const metrics = w.heartbeat_metrics || {};
           return '<tr>' +
-            '<td class="mono">' + w.worker_id + '</td>' +
-            '<td class="pill ' + (w.status === 'ONLINE' ? 'ok' : 'bad') + '">' + w.status + '</td>' +
-            '<td class="mono">' + (w.current_job_id || '-') + '</td>' +
+            '<td class="mono">' + escapeHtml(w.worker_id) + '</td>' +
+            '<td class="pill ' + (w.status === 'ONLINE' ? 'ok' : 'bad') + '">' + escapeHtml(w.status) + '</td>' +
+            '<td class="mono">' + escapeHtml(w.current_job_id || '-') + '</td>' +
             '<td>' + (w.heartbeat_age_sec == null ? 'n/a' : formatAge(w.heartbeat_age_sec)) + '</td>' +
-            '<td class="small mono">' + ((w.capabilities || []).join(', ') || '-') + '</td>' +
-            '<td class="small mono">' + metricsText(metrics) + '</td>' +
+            '<td class="small mono">' + escapeHtml((w.capabilities || []).join(', ') || '-') + '</td>' +
+            '<td class="small mono">' + escapeHtml(metricsText(metrics)) + '</td>' +
           '</tr>';
         }).join('');
       }
@@ -484,11 +494,11 @@ func dashboardUI() http.HandlerFunc {
           const details = ev.details ? JSON.stringify(ev.details) : '';
           return '<tr>' +
             '<td>' + formatEpoch(ev.ts) + '</td>' +
-            '<td>' + (ev.component || '') + '</td>' +
-            '<td>' + (ev.event || '') + '</td>' +
-            '<td>' + (ev.level || '') + '</td>' +
-            '<td class="small mono">' + (ev.job_id ? ev.job_id : '') + (ev.worker_id ? ' / ' + ev.worker_id : '') + '</td>' +
-            '<td class="small mono">' + details + '</td>' +
+            '<td>' + escapeHtml(ev.component || '') + '</td>' +
+            '<td>' + escapeHtml(ev.event || '') + '</td>' +
+            '<td>' + escapeHtml(ev.level || '') + '</td>' +
+            '<td class="small mono">' + escapeHtml((ev.job_id ? ev.job_id : '') + (ev.worker_id ? ' / ' + ev.worker_id : '')) + '</td>' +
+            '<td class="small mono">' + escapeHtml(details) + '</td>' +
           '</tr>';
         }).join('');
       }
@@ -571,6 +581,14 @@ func dashboardUI() http.HandlerFunc {
       }
 
       async function init() {
+        const queryToken = new URLSearchParams(window.location.search).get('token');
+        if (queryToken) {
+          tokenInput.value = queryToken;
+          localStorage.setItem(STORAGE_KEY, queryToken);
+          const current = new URL(window.location.href);
+          current.searchParams.delete('token');
+          window.history.replaceState({}, '', current.toString());
+        }
         const saved = localStorage.getItem(STORAGE_KEY);
         if (saved) tokenInput.value = saved;
         setStatus('ready');
@@ -592,28 +610,28 @@ func dashboardUI() http.HandlerFunc {
 </html>`
 
 type controlConfig struct {
-	addr                           string
-	dbPath                         string
-	adminToken                     string
-	adminTokenPrev                 string
-	workerToken                    string
-	workerTokenPrev                string
-	workerTokenSecret              string
-	workerTokenTTL                 time.Duration
-	tlsCert                        string
-	tlsKey                         string
-	tlsClientCA                    string
-	tlsRequireClientCert           bool
-	heartbeatTimeout               time.Duration
-	reconcileInterval              time.Duration
-	cleanupInterval                time.Duration
-	queueAgingWindowSeconds        int64
-	maxConcurrentRetriesPerWorker  int
-	preemptBacklogThreshold        int
+	addr                               string
+	dbPath                             string
+	adminToken                         string
+	adminTokenPrev                     string
+	workerToken                        string
+	workerTokenPrev                    string
+	workerTokenSecret                  string
+	workerTokenTTL                     time.Duration
+	tlsCert                            string
+	tlsKey                             string
+	tlsClientCA                        string
+	tlsRequireClientCert               bool
+	heartbeatTimeout                   time.Duration
+	reconcileInterval                  time.Duration
+	cleanupInterval                    time.Duration
+	queueAgingWindowSeconds            int64
+	maxConcurrentRetriesPerWorker      int
+	preemptBacklogThreshold            int
 	preemptHighPriorityMinimumPriority int
-	jobsRetentionCompletedDays int
-	artifactsRetentionDays     int
-	eventsRetentionDays       int
+	jobsRetentionCompletedDays         int
+	artifactsRetentionDays             int
+	eventsRetentionDays                int
 }
 
 type controlConfigFile struct {
@@ -629,23 +647,23 @@ type controlConfigFile struct {
 	TLSCert                      *string `json:"tls_cert"`
 	TLSKey                       *string `json:"tls_key"`
 	TLSClientCA                  *string `json:"tls_client_ca"`
-	TLSRequireClientCert          *bool   `json:"tls_require_client_cert"`
-	HeartbeatTimeoutSeconds       *int64  `json:"heartbeat_timeout_seconds"`
-	ReconcileIntervalSeconds      *int64  `json:"reconcile_interval_seconds"`
-	CleanupIntervalSeconds        *int64  `json:"cleanup_interval_seconds"`
+	TLSRequireClientCert         *bool   `json:"tls_require_client_cert"`
+	HeartbeatTimeoutSeconds      *int64  `json:"heartbeat_timeout_seconds"`
+	ReconcileIntervalSeconds     *int64  `json:"reconcile_interval_seconds"`
+	CleanupIntervalSeconds       *int64  `json:"cleanup_interval_seconds"`
 	QueueAgingWindowSeconds      *int64  `json:"queue_aging_window_seconds"`
-	MaxRetryConcurrencyPerWorker  *int64  `json:"max_retry_concurrency_per_worker"`
+	MaxRetryConcurrencyPerWorker *int64  `json:"max_retry_concurrency_per_worker"`
 	PreemptBacklogThreshold      *int64  `json:"preempt_high_priority_backlog_threshold"`
 	PreemptPriorityFloor         *int64  `json:"preempt_high_priority_floor"`
-	JobsRetentionCompletedDays    *int64  `json:"jobs_retention_completed_days"`
-	ArtifactsRetentionDays        *int64  `json:"artifacts_retention_days"`
+	JobsRetentionCompletedDays   *int64  `json:"jobs_retention_completed_days"`
+	ArtifactsRetentionDays       *int64  `json:"artifacts_retention_days"`
 	EventsRetentionDays          *int64  `json:"events_retention_days"`
 }
 
 type controlHealthCheck struct {
-	Status   string                       `json:"status"`
-	Checked  string                       `json:"checked_at"`
-	Checks  map[string]map[string]any     `json:"checks"`
+	Status  string                    `json:"status"`
+	Checked string                    `json:"checked_at"`
+	Checks  map[string]map[string]any `json:"checks"`
 }
 
 func parseConfig() controlConfig {
@@ -703,8 +721,8 @@ func parseConfig() controlConfig {
 	if strings.TrimSpace(cfg.adminToken) == "" {
 		cfg.adminToken = legacyToken
 	}
-	if strings.TrimSpace(cfg.workerToken) == "" {
-		cfg.workerToken = legacyToken
+	if strings.TrimSpace(cfg.workerToken) == "" && strings.TrimSpace(cfg.workerTokenSecret) == "" {
+		log.Fatalf("worker authentication token required: set -worker-token or -worker-token-secret (or config equivalents)")
 	}
 	if workerTokenTTLSeconds < 1 {
 		workerTokenTTLSeconds = 1
@@ -815,12 +833,51 @@ func getenvInt(name string, fallback int64) int64 {
 
 func withAdminAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := cfg.authorizeAdminRequest(strings.TrimSpace(r.Header.Get(authHeaderName))); err != nil {
+		if err := cfg.authorizeAdminRequest(getAdminTokenFromRequest(r)); err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		next(w, r)
 	}
+}
+
+func withUIAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := getUIAdminTokenFromRequest(r)
+		if strings.TrimSpace(token) != "" && cfg.authorizeAdminRequest(token) == nil {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "hdcf_admin_token",
+				Value:    token,
+				Path:     "/",
+				HttpOnly: true,
+				MaxAge:   86400,
+				SameSite: http.SameSiteLaxMode,
+				Secure:   r.TLS != nil,
+			})
+		}
+		if err := cfg.authorizeAdminRequest(token); err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func getAdminTokenFromRequest(r *http.Request) string {
+	if token := strings.TrimSpace(r.Header.Get(authHeaderName)); token != "" {
+		return token
+	}
+	if cookie, err := r.Cookie("hdcf_admin_token"); err == nil {
+		return strings.TrimSpace(cookie.Value)
+	}
+	return ""
+}
+
+func getUIAdminTokenFromRequest(r *http.Request) string {
+	if token := getAdminTokenFromRequest(r); token != "" {
+		return token
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
 }
 
 func withWorkerAuth(cfg *controlConfig, next http.HandlerFunc) http.HandlerFunc {
@@ -847,9 +904,6 @@ func (cfg *controlConfig) authorizeAdminRequest(token string) error {
 }
 
 func (cfg *controlConfig) authorizeWorkerRequest(token string, workerID string) error {
-	if cfg.workerToken == "" {
-		cfg.workerToken = cfg.adminToken
-	}
 	if tokenMatches(token, cfg.workerToken) {
 		return nil
 	}
@@ -963,7 +1017,7 @@ func createJob(s *store.Store) http.HandlerFunc {
 			return
 		}
 		auditEvent("info", "control.jobs_create", requestID, map[string]any{
-			"command": req.Command,
+			"command":  req.Command,
 			"attempts": req.MaxAttempts,
 		})
 		res, err := s.CreateJob(ctx, req)
@@ -994,10 +1048,10 @@ func jobsHandler(s *store.Store) http.HandlerFunc {
 			jobs, err := s.ListJobs(ctx, status, workerID)
 			if err != nil {
 				auditEvent("warn", "control.jobs_list", requestID, map[string]any{
-					"status_code": http.StatusInternalServerError,
+					"status_code":   http.StatusInternalServerError,
 					"status_filter": status,
 					"worker_filter": workerID,
-					"error":       err.Error(),
+					"error":         err.Error(),
 				})
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
@@ -1043,15 +1097,15 @@ func metricsHandler(s *store.Store) http.HandlerFunc {
 			return
 		}
 		auditEvent("info", "control.metrics", requestID, map[string]any{
-			"status_code":          http.StatusOK,
-			"workers_total":        metrics.WorkersTotal,
-			"workers_online":       metrics.WorkersOnline,
-			"workers_offline":      metrics.WorkersOffline,
-			"retrying_jobs":        metrics.RetryingJobs,
-			"lost_jobs":            metrics.LostJobs,
-			"completed_last_5m":    metrics.CompletedLast5m,
-			"failed_last_5m":       metrics.FailedLast5m,
-			"avg_completion_sec":    metrics.AvgCompletionSec,
+			"status_code":        http.StatusOK,
+			"workers_total":      metrics.WorkersTotal,
+			"workers_online":     metrics.WorkersOnline,
+			"workers_offline":    metrics.WorkersOffline,
+			"retrying_jobs":      metrics.RetryingJobs,
+			"lost_jobs":          metrics.LostJobs,
+			"completed_last_5m":  metrics.CompletedLast5m,
+			"failed_last_5m":     metrics.FailedLast5m,
+			"avg_completion_sec": metrics.AvgCompletionSec,
 		})
 		writeJSON(w, http.StatusOK, metrics)
 	}
@@ -1099,8 +1153,8 @@ func getJobHandler(s *store.Store) http.HandlerFunc {
 			return
 		}
 		auditEvent("info", "control.job_get", requestID, map[string]any{
-			"job_id": job.JobID,
-			"status": job.Status,
+			"job_id":      job.JobID,
+			"status":      job.Status,
 			"status_code": http.StatusOK,
 		})
 		writeJSON(w, http.StatusOK, job)
@@ -1226,7 +1280,7 @@ func healthzHandler(s *store.Store, dbPath string) http.HandlerFunc {
 
 		diag, err := s.MigrationDiagnostics(ctx)
 		dbCheck := map[string]any{
-			"status": "ok",
+			"status":      "ok",
 			"diagnostics": diag,
 		}
 		if err != nil {
@@ -1405,12 +1459,12 @@ func nextJob(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 			return
 		}
 		auditEvent("info", "control.next_job", requestID, map[string]any{
-			"worker_id":        workerID,
-			"job_id":           job.JobID,
-			"assignment_id":    job.AssignmentID,
-			"attempt_count":    job.AttemptCount,
-			"status_code":      http.StatusOK,
-			"transition_to":    hdcf.StatusAssigned,
+			"worker_id":             workerID,
+			"job_id":                job.JobID,
+			"assignment_id":         job.AssignmentID,
+			"attempt_count":         job.AttemptCount,
+			"status_code":           http.StatusOK,
+			"transition_to":         hdcf.StatusAssigned,
 			"assignment_expires_at": job.AssignmentExpiresAt,
 		})
 		writeJSON(w, http.StatusOK, job)
@@ -1547,11 +1601,11 @@ func heartbeat(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 			return
 		}
 		auditEvent("info", "control.heartbeat", requestID, map[string]any{
-			"status_code":      http.StatusOK,
-			"worker_id":        workerID,
-			"current_job_id":   req.CurrentJobID,
-			"timestamp":        req.Timestamp,
-			"heartbeat_seq":    req.Sequence,
+			"status_code":    http.StatusOK,
+			"worker_id":      workerID,
+			"current_job_id": req.CurrentJobID,
+			"timestamp":      req.Timestamp,
+			"heartbeat_seq":  req.Sequence,
 		})
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
@@ -1791,22 +1845,22 @@ func completeJob(cfg *controlConfig, s *store.Store) http.HandlerFunc {
 		req.WorkerID = workerID
 		if err := s.CompleteJob(ctx, req); err != nil {
 			auditEvent("warn", "control.complete", requestID, map[string]any{
-				"status_code": http.StatusConflict,
-				"job_id":      req.JobID,
-				"worker_id":   workerID,
+				"status_code":   http.StatusConflict,
+				"job_id":        req.JobID,
+				"worker_id":     workerID,
 				"assignment_id": req.AssignmentID,
-				"error":       err.Error(),
+				"error":         err.Error(),
 			})
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
 		auditEvent("info", "control.complete", requestID, map[string]any{
-			"status_code":   http.StatusOK,
-			"job_id":        req.JobID,
-			"worker_id":     workerID,
-			"assignment_id": req.AssignmentID,
-			"artifact_id":   req.ArtifactID,
-			"exit_code":     req.ExitCode,
+			"status_code":    http.StatusOK,
+			"job_id":         req.JobID,
+			"worker_id":      workerID,
+			"assignment_id":  req.AssignmentID,
+			"artifact_id":    req.ArtifactID,
+			"exit_code":      req.ExitCode,
 			"completion_seq": req.CompletionSeq,
 		})
 		writeJSON(w, http.StatusOK, map[string]string{"status": hdcf.StatusCompleted, "job_id": req.JobID})
@@ -1913,8 +1967,8 @@ func runReconciler(ctx context.Context, s *store.Store, interval time.Duration) 
 func runCleanup(ctx context.Context, s *store.Store, interval time.Duration, jobsRetentionDays, artifactsRetentionDays, eventsRetentionDays int) {
 	if interval <= 0 {
 		auditEvent("warn", "control.cleanup", "", map[string]any{
-			"status":  "disabled",
-			"reason":  "cleanup interval must be greater than zero",
+			"status":   "disabled",
+			"reason":   "cleanup interval must be greater than zero",
 			"interval": interval.Seconds(),
 		})
 		return
@@ -1948,10 +2002,10 @@ func runCleanupOnce(s *store.Store, jobsRetentionDays, artifactsRetentionDays, e
 	}
 
 	auditEvent("info", "control.cleanup", runID, map[string]any{
-		"status": "start",
-		"jobs_retention_days": jobsRetentionDays,
+		"status":                   "start",
+		"jobs_retention_days":      jobsRetentionDays,
 		"artifacts_retention_days": artifactsRetentionDays,
-		"events_retention_days": eventsRetentionDays,
+		"events_retention_days":    eventsRetentionDays,
 	})
 
 	pathSet := map[string]struct{}{}
@@ -2011,13 +2065,13 @@ func runCleanupOnce(s *store.Store, jobsRetentionDays, artifactsRetentionDays, e
 	}
 
 	auditEvent("info", "control.cleanup", runID, map[string]any{
-		"status": "complete",
-		"jobs_deleted":   jobsDeleted,
-		"events_deleted": eventsDeleted,
+		"status":          "complete",
+		"jobs_deleted":    jobsDeleted,
+		"events_deleted":  eventsDeleted,
 		"paths_candidate": pathsCandidate,
-		"paths_deleted":  pathsDeleted,
-		"paths_missing":  pathsMissing,
-		"paths_failed":   pathsFailed,
+		"paths_deleted":   pathsDeleted,
+		"paths_missing":   pathsMissing,
+		"paths_failed":    pathsFailed,
 	})
 
 	if jobsDeleted == 0 && eventsDeleted == 0 && pathsCandidate == 0 && pathsFailed == 0 {

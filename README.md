@@ -1,386 +1,209 @@
-# HDCF MVP (Go + SQLite)
-
-This repository contains an implementation of the feasibility plan from `mvp.md`:
-
-- Pull-based control plane (`cmd/control`)
-- Worker daemon (`cmd/worker`)
-- Simple CLI to enqueue jobs (`cmd/hdcfctl`)
-- Durable state in SQLite (`jobs.db`)
-- Heartbeat + stale-worker recovery
-
-## Quick start
-
-### 1) Start control plane on Mac
-
-```bash
-go run ./cmd/control -addr :8080 -db ./jobs.db -admin-token dev-token -worker-token dev-token
-```
-
-or using config file:
-
-```bash
-go run ./cmd/control -config deploy/control-config.example.json
-```
-
-The same path can be provided with `HDCF_CONTROL_CONFIG=/etc/hdcf/control-config.json`.
-
-Environment variables available:
-
-- `HDCF_ADDR` (default `:8080`)
-- `HDCF_DB_PATH` (default `jobs.db`)
-- `HDCF_CONTROL_CONFIG` (path to JSON config file)
-- `HDCF_API_TOKEN` (legacy shared token, default `dev-token`)
-- `HDCF_ADMIN_TOKEN` (admin token; overrides legacy token)
-- `HDCF_ADMIN_TOKEN_PREV` (previous admin token)
-- `HDCF_WORKER_TOKEN` (worker token; overrides legacy token)
-- `HDCF_WORKER_TOKEN_PREV` (previous worker token)
-- `HDCF_WORKER_TOKEN_SECRET` (optional signing secret for worker tokens)
-- `HDCF_WORKER_TOKEN_TTL_SECONDS` (default `3600`)
-- `HDCF_HEARTBEAT_TIMEOUT_SECONDS` (default `60`)
-- `HDCF_RECONCILE_INTERVAL_SECONDS` (default `10`)
-- `HDCF_CLEANUP_INTERVAL_SECONDS` (default `300`)
-- `HDCF_QUEUE_AGING_WINDOW_SECONDS` (default `0`)
-- `HDCF_MAX_RETRY_CONCURRENCY_PER_WORKER` (default `0`)
-- `HDCF_PREEMPT_HIGH_PRIORITY_BACKLOG_THRESHOLD` (default `0`)
-- `HDCF_PREEMPT_HIGH_PRIORITY_FLOOR` (default `0`)
-- `HDCF_JOBS_RETENTION_COMPLETED_DAYS` (default `30`)
-- `HDCF_ARTIFACTS_RETENTION_DAYS` (default `14`)
-- `HDCF_EVENTS_RETENTION_DAYS` (default `30`)
-- `HDCF_TLS_CERT` (optional path for HTTPS cert)
-- `HDCF_TLS_KEY` (optional path for HTTPS key)
-- `HDCF_TLS_CLIENT_CA` (optional CA cert for worker client auth)
-
-Control-plane cleanup controls:
-- `-cleanup-interval-seconds` (how often retention sweeps run)
-- `-jobs-retention-completed-days` (how long terminal jobs stay in sqlite)
-- `-artifacts-retention-days` (how long terminal artifact paths are eligible for on-disk cleanup)
-- `-events-retention-days` (how long audit events are retained)
-- `-tls-cert`, `-tls-key` (start HTTPS control plane)
-- `-tls-client-ca` (optional CA for optional client cert validation)
-- `-tls-require-client-cert` (require and verify worker client certs)
-
-Scheduling controls:
-- `-queue-aging-window-seconds` (fairness age bonus window in seconds)
-- `-max-retry-concurrency-per-worker` (max concurrent retry jobs per worker; `0` means unlimited)
-- `-preempt-high-priority-backlog-threshold` (gates lower-priority jobs when high-priority backlog is high)
-- `-preempt-high-priority-floor` (priority threshold used during preemption mode)
-- `-config` (JSON file path; defaults to `HDCF_CONTROL_CONFIG`)
-
-### 2) Start worker on ASUS
-
-```bash
-go run ./cmd/worker -control-url https://<mac-ip>:8080 -worker-token dev-token -log-dir ./worker-logs
-```
-
-or using config file:
-
-```bash
-go run ./cmd/worker -config deploy/worker-config.example.json
-```
-
-The same path can be provided with `HDCF_WORKER_CONFIG=/etc/hdcf/worker-config.json`.
-
-Worker options:
-
-- `-control-url` (default `http://localhost:8080`)
-- `-worker-id` (default `hostname-<generated>`)
-- `-token` (legacy fallback token, default `dev-token`)
-- `-worker-token` (defaults to `-token`)
-- `-worker-token-secret` (optional HMAC secret for signed token mode)
-- `-worker-token-ttl-seconds` (default `3600`)
-- `-tls-ca` (ca bundle for control-plane cert)
-- `-tls-client-cert` (client cert for mTLS)
-- `-tls-client-key` (client key for mTLS)
-- `-capabilities` (default ``, comma-separated worker capabilities, e.g. `gpu,ssd`)
-- `-poll-interval-seconds` (default `3`)
-- `-heartbeat-interval-seconds` (default `5`)
-- `-request-timeout-seconds` (default `10`)
-- `-log-dir` (default `worker-logs`)
-- `-log-retention-days` (default `30`)
-- `-log-cleanup-interval-seconds` (default `300`)
-- `-heartbeat-metrics` (default `false`) — include optional resource metrics in heartbeat payload
-- `-artifact-storage-backend` (default `local`) — artifact destination strategy (`local`, `nfs`, `s3`)
-- `-artifact-storage-location` (required for `nfs` backend) — storage path for non-local artifact backends
-- `-command-allowlist` (default `false`) — enable command allowlist enforcement
-- `-allowed-commands` (default ``) — comma-separated command allowlist when `-command-allowlist` is on
-- `-allowed-working-dirs` (default ``) — comma-separated list of allowed working directories
-- `-require-non-root` (default `false`) — reject jobs while running as root
-- `-dry-run` (default `false`) — validate policy and write simulated artifacts without executing jobs
-- `-config` (JSON file path; defaults to `HDCF_WORKER_CONFIG`)
-
-Environment variables:
-
-- `HDCF_WORKER_CAPABILITIES` (comma-separated capabilities)
-- `HDCF_WORKER_NONCE`
-- `HDCF_CONTROL_URL`
-- `HDCF_WORKER_ID`
-- `HDCF_WORKER_LOG_RETENTION_DAYS` (default `30`)
-- `HDCF_WORKER_LOG_CLEANUP_INTERVAL_SECONDS` (default `300`)
-- `HDCF_WORKER_COMMAND_ALLOWLIST` (`true` to enforce allowlist mode)
-- `HDCF_WORKER_ALLOWED_COMMANDS` (comma-separated allowed command binaries)
-- `HDCF_WORKER_ALLOWED_WORKING_DIRS` (comma-separated working directory allowlist)
-- `HDCF_WORKER_REQUIRE_NON_ROOT` (`true` to block root execution)
-- `HDCF_WORKER_DRY_RUN` (`true` for simulated execution)
-- `HDCF_ARTIFACT_STORAGE_BACKEND` (default `local`; values: `local`, `nfs`, `s3`)
-- `HDCF_ARTIFACT_STORAGE_LOCATION` (required for `nfs` backend)
-- `HDCF_TLS_CA` (ca bundle for control-plane cert)
-- `HDCF_TLS_CLIENT_CERT` (client cert for mTLS)
-- `HDCF_TLS_CLIENT_KEY` (client key for mTLS)
-- `HDCF_WORKER_CONFIG` (path to JSON config file)
-- `HDCF_WORKER_TOKEN` (worker token; defaults to `HDCF_API_TOKEN`)
-- `HDCF_WORKER_TOKEN_SECRET` (HMAC secret for signed token mode)
-- `HDCF_WORKER_TOKEN_TTL_SECONDS` (default `3600`)
-
-Security note:
-
-- When `-command-allowlist` is enabled, the worker only executes commands whose binary name or full command path matches one of `-allowed-commands` (or `HDCF_WORKER_ALLOWED_COMMANDS`).
-- When `-allowed-working-dirs` is set, `working_dir` must exist and be under one of the allowed directories.
-- If `-dry-run` is enabled, no external processes are spawned; jobs are validated and completed as zero exit jobs with recorded dry-run artifacts.
-
-## Security model
-
-- Admin endpoints (`/jobs`, `/jobs/{id}`, `/abort`, `/workers`, `/events`) require admin credentials.
-- Worker endpoints (`/register`, `/next-job`, `/ack`, `/heartbeat`, `/reconnect`, `/complete`, `/fail`) require worker credentials.
-- If `-worker-token-secret` is set on both sides, workers use short-lived signed token format `v1.<payload>.<sig>`.
-- Use TLS (`-tls-cert`/`-tls-key`) for HTTPS and consider mTLS with `-tls-client-ca` + `-tls-require-client-cert`.
-
-Health endpoint:
-
-- `GET /healthz` (no auth) reports startup readiness and control-plane health.
-  - DB connectivity and migration/schema checks.
-  - DB filesystem writeability probe.
-
-Example:
-
-```bash
-curl http://localhost:8080/healthz
-```
-
-Retention and cleanup behavior:
-- Control plane runs periodic retention sweeps on `-cleanup-interval-seconds`.
-- Control plane sweeps can:
-  - delete terminal jobs (`COMPLETED`, `FAILED`, `ABORTED`) older than `-jobs-retention-completed-days`;
-  - delete terminal job artifact file paths older than `-artifacts-retention-days`;
-  - delete audit events older than `-events-retention-days`;
-  - emit cleanup audit events (`control.cleanup*`) with counts and deletion outcomes.
-- Worker retains log/artifact files locally and periodically removes old artifacts via `log-retention-days`.
-
-Deployment examples (sample files in `deploy/`):
-
-- `control-config.example.json`
-- `worker-config.example.json`
-- `hdcf-control.service`
-- `hdcf-worker.service`
-- `hdcf-control.supervisor.conf`
-- `hdcf-worker.supervisor.conf`
-
-Each file is intentionally minimal and should be adapted to your host paths and user accounts.
-
-### 3) Submit and inspect jobs with `hdcfctl`
-
-```bash
-go run ./cmd/hdcfctl submit \
-  --url http://<mac-ip>:8080 \
-  --token dev-token \
-  --command sleep \
-  --args "2" \
-  --priority 10
-```
-
-The CLI sends `POST /jobs` and returns the new `job_id`.
-
-Optional scheduling fields:
-- `--priority` (higher value = higher queue priority)
-- `--scheduled-at` (unix seconds timestamp when job becomes eligible; `0` means now)
-
-List jobs:
-
-```bash
-go run ./cmd/hdcfctl jobs list --status=PENDING
-```
-
-Show one job:
-
-```bash
-go run ./cmd/hdcfctl jobs describe <job_id>
-```
-
-List workers:
-
-```bash
-go run ./cmd/hdcfctl workers list
-```
-
-Abort a job:
-
-```bash
-go run ./cmd/hdcfctl abort --job-id <job_id> --reason "no longer needed"
-```
-
-Invoke reconnect replay manually:
-
-```bash
-go run ./cmd/hdcfctl replay --worker-id worker-1
-go run ./cmd/hdcfctl replay --worker-id worker-1 --completed-jobs-file /tmp/reconnect.json
-```
-
-Example `reconnect.json` payload:
-
-```json
-[
-  {
-    "job_id": "00000000-0000-0000-0000-000000000000",
-    "assignment_id": "assign-123",
-    "completion_seq": 1,
-    "artifact_id": "a1",
-    "status": "COMPLETED",
-    "exit_code": 0,
-    "stdout_path": "/tmp/stdout.txt",
-    "stderr_path": "/tmp/stderr.txt",
-    "result_summary": "manual replay"
-  }
-]
-```
-
-Advanced scheduling fields are accepted directly by the API as part of `POST /jobs`:
-- `needs_gpu` (`true`/`false`)
-- `requirements` (string array)
-- `worker_capabilities` (on `POST /register`, via worker startup registration)
-
-## Implemented endpoints
-
-- `POST /jobs`
-- `POST /register`
-- `GET /next-job?worker_id=...`
-- `POST /ack`
-- `POST /heartbeat`
-- `POST /reconnect`
-- `POST /abort`
-- `GET /jobs` (optional `status` and `worker_id` query filters)
-- `GET /jobs/{job_id}`
-- `GET /workers`
-- `POST /complete`
-- `POST /fail`
-- `GET /metrics` (admin)
-- `GET /healthz` (authless)
-- `GET /events` (optional filters: `component`, `event`, `worker_id`, `job_id`, `since_id`, `limit`)  
-  `since_id` returns only events with `id > since_id` for incremental polling.
-- `POST /reconnect` supports optional `current_job_id` and completed-job replay payload, and can now be manually invoked via `hdcfctl replay`.
-
-Queue ordering behavior:
-- `GET /next-job` claims from `PENDING` jobs by descending `priority`, then ascending `created_at`, then ascending `job_id`.
-- Optional scheduling controls:
-  - `-queue-aging-window-seconds` boosts older low-priority work over time to improve fairness.
-  - `-preempt-high-priority-backlog-threshold` and `-preempt-high-priority-floor` can temporarily prioritize higher-priority backlog.
-  - `-max-retry-concurrency-per-worker` limits retry job assignment pressure per worker.
-- Jobs with `scheduled_at` in the future are not claimed until their scheduled time arrives.
-
-Read/observability behavior:
-
-- `GET /jobs` returns job list entries with state, timestamps, attempt counters, worker assignment, and heartbeat age for jobs with active workers.
-- `GET /jobs/{job_id}` returns a single job detail payload with the same fields.
-- `GET /workers` returns worker rows with heartbeat age in seconds and optional latest `heartbeat_metrics`.
-- `GET /events` returns durable control-plane structured events (filtered by component/event/worker/job, optional `since_id` cursor, with a default descending order and configurable limit).  
-  Use this as the primary recovery audit trail before touching the database directly.
-- `GET /metrics` returns aggregated JSON metrics snapshot for observability:
-  - `queue_depth_by_status`
-  - worker totals (`workers_total`, `workers_online`, `workers_offline`)
-  - `retrying_jobs` and `lost_jobs`
-  - completion/failure counters over 5 minutes (`completed_last_5m`, `failed_last_5m`)
-  - `avg_completion_seconds` across completed jobs.
-
-Abort behavior:
-
-- `POST /abort` accepts `{ "job_id": "<id>" }`, `{ "worker_id": "<id>" }`, or both.
-- Optional `reason` field can be supplied and is persisted in the job `last_error` field.
-- Accepted transitions move a job to `ABORTED`, clear active assignment metadata, and clear the worker's current assignment.
-
-ACK flow behavior:
-
-- `/next-job` transitions a claimed job to `ASSIGNED` and returns `assignment_id` plus `assignment_expires_at` (Unix epoch seconds).
-- Worker must call `/ack` before executing with `job_id`, `worker_id`, and `assignment_id`.
-- `/ack` transitions job from `ASSIGNED` to `RUNNING`.
-- Reconciler returns stale assignments (`ASSIGNED` with expired `assignment_expires_at`) to `PENDING`.
-
-Completion safety behavior:
-
-- `POST /complete` and `POST /fail` require `assignment_id` and only apply when it matches the job's current lease.
-- `POST /complete` requires artifact contract fields (`artifact_id`, `stdout_path`, `stderr_path`, `stdout_tmp_path`, `stderr_tmp_path`).
-- `POST /complete` stores artifact metadata in SQLite and rejects completion when artifact fields are incomplete or violate the temp/final naming contract.
-- `POST /complete` also stores artifact abstraction metadata (`artifact_backend`, `artifact_location`, `artifact_upload_state`, `artifact_upload_error`).
-- On success, worker computes and reports SHA-256 checksums for stdout/stderr artifacts; the control plane persists them in job records.
-- `/complete` and `/fail` are idempotent for terminal states (`COMPLETED`/`FAILED`) and return success without state changes.
-- To avoid out-of-order mutation, worker heartbeats and completions now include monotonic sequence numbers:
-  - `heartbeat` payload includes `seq`.
-  - `complete` payload includes `completion_seq`.
-  - Control plane ignores stale heartbeats and stale completions when these fields indicate older messages.
-
-Reconnection behavior:
-
-- `POST /reconnect` is sent by workers on startup and accepts:
-  - `worker_id`
-  - optional `current_job_id`
-  - optional list of recently completed jobs (`job_id`, `assignment_id`, status and completion details)
-- Control plane reconciles `current_job_id` and applies reconnection completion replay.
-- Worker removes replayed completed jobs from its local recovery state after an accepted action.
-
-Additional reconnection robustness:
-
-- Workers queue completion/failure replay payloads locally and flush them on successful `heartbeat`/`next-job` control-plane calls as well as startup reconnect.
-- If the control plane is temporarily unreachable while sending completions, finished artifacts remain locally queued and are retried automatically on the next successful control call.
-
-Worker startup options:
-
-- `-state-file` (default `<log-dir>/worker-state.json`) for persisted reconnect replay data.
-- `-worker-nonce` (optional) optional registration nonce that must match CP for the same `worker_id`.
-
-Worker startup flow now includes:
-- `POST /register` with `worker_id` (and optional `nonce`)
-- `POST /reconnect`
-- normal heartbeat/ack/complete/fail flow
-
-On startup, the control plane now performs one reconciliation sweep immediately (in addition to the periodic reconciler) to recover stale assignments and worker state after a restart.
-
-## Data model
-
-Tables:
-
-- `jobs`:
-  - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `priority`, `scheduled_at`, `needs_gpu`, `requirements`,
-    `created_at`, `updated_at`,
-    `attempt_count`, `max_attempts`, `worker_id`, `assignment_id`, `assignment_expires_at`, `last_error`, `result_path`,
-    `artifact_id`, `artifact_stdout_tmp_path`, `artifact_stdout_path`,
-    `artifact_stdout_sha256`, `artifact_stderr_tmp_path`, `artifact_stderr_path`,
-    `artifact_stderr_sha256`, `artifact_storage_backend`, `artifact_storage_location`,
-    `artifact_upload_state`, `artifact_upload_error`, `updated_by`
-- `workers`:
-  - `worker_id`, `last_seen`, `current_job_id`, `status`, `registered_at`, `registration_nonce`, `worker_capabilities`
-- `audit_events`:
-  - `id`, `ts`, `component`, `level`, `event`, `request_id`, `worker_id`, `job_id`, `details`
-
-Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAILED`, `LOST`, `RETRYING`, `ABORTED` (SRS-complete core state machine is in place; advanced lifecycle transitions are being implemented by checklist).
-
-## SRS checklist
-
-- See `SRS_IMPLEMENTATION_CHECKLIST.md` for the full ordered implementation plan and progress tracking.
-- See `EXPANSION_CHECKLIST.md` for the post-SRS roadmap (UI, security, retention, and hardening).
-
-## SRS recovery test scenarios
-
-- Section 7 scenarios from `SRS.md` are documented in `SRS_TEST_SCENARIOS.md`.
-- A helper script exists at `scripts/reliability-scenarios.sh` for scenario status checks and duplicate-completion replay.
-- Current automated coverage includes `internal/store/store_test.go` (completion idempotency/noop behavior).
-
-## UI
-
-- Open `http://<control-plane>/ui` for a lightweight dashboard.
-- The dashboard is unauthenticated for page load, but you must provide the `X-API-Token` value in the page input to call APIs.
-
-## Notes
-
-- Jobs are claimed by polling, never pushed.
-- Recovery on stale heartbeat marks workers `OFFLINE`, moves `RUNNING` jobs to `LOST`, then recovers:
-  - `LOST` -> `RETRYING` after a timeout window
-  - `RETRYING` -> `PENDING` when retries remain
-  - `RETRYING` -> `FAILED` when retries are exhausted.
-- `timeout_ms` is enforced by worker execution context and reported as a failure when exceeded.
+# Entropy
+
+**Entropy is a partition-tolerant distributed compute fabric designed for unreliable infrastructure.**
+
+It provides durable job scheduling, lease-based assignment, deterministic recovery,
+and eventual consistency under:
+
+- Power loss
+- Worker crashes
+- Network partitions
+- Duplicate messages
+- Out-of-order delivery
+- Control-plane restarts
+
+Entropy is designed for environments where infrastructure cannot be trusted.
+
+---
+
+# System Model
+
+Entropy consists of two roles:
+
+## Control Plane
+- Durable SQLite-backed state
+- Job queue & state machine
+- Lease-based assignment
+- Worker registration & capability tracking
+- Reconciliation engine
+- Retry & recovery transitions
+- Structured audit events
+- Metrics aggregation
+
+## Worker Nodes
+- Poll-based job acquisition
+- Assignment ACK handshake
+- Execution with timeout enforcement
+- Artifact generation & checksum validation
+- Heartbeat with monotonic sequence numbers
+- Local replay buffer for reconnect
+- Deterministic completion replay
+
+---
+
+# Core Guarantees
+
+Entropy provides the following execution semantics:
+
+### 1. No Duplicate Assignment
+A job lease (`assignment_id`) ensures only one worker can legally complete a job.
+
+Concurrent claims are prevented by serializable DB transactions.
+
+### 2. Idempotent Completion
+- `assignment_id` validation
+- Monotonic `completion_seq`
+- Terminal-state no-op protection
+
+Duplicate completion messages do not corrupt state.
+
+### 3. Crash Recovery
+If a worker:
+- Crashes
+- Loses power
+- Stops heartbeating
+
+The control plane transitions:
+
+
+RUNNING → LOST → RETRYING → PENDING → (reassigned)
+
+
+Attempt counts increment safely and deterministically.
+
+### 4. Control-Plane Restart Safety
+- Durable SQLite state
+- Immediate reconciliation sweep
+- Stale leases reclaimed
+- No orphaned RUNNING state
+
+### 5. Eventual Consistency
+Workers may:
+- Replay completions
+- Replay state on reconnect
+- Resume after network partitions
+
+Control plane reconciliation ensures final deterministic state.
+
+---
+
+# Execution Semantics
+
+Entropy implements:
+
+- At-least-once execution model
+- Idempotent completion enforcement
+- Lease-based execution safety
+- Priority-aware scheduling
+- Capability-based assignment
+- Scheduled (delayed) job eligibility
+- Retry concurrency controls
+- High-priority preemption gates
+- Queue aging fairness model
+
+---
+
+# Failure Model
+
+Entropy explicitly handles:
+
+| Failure | Behavior |
+|----------|-----------|
+| Worker crash | Job → LOST → RETRYING → PENDING |
+| Power loss | Worker offline → lease expires → requeue |
+| Network partition | Worker buffers completions → replay |
+| Duplicate completion | Ignored safely |
+| Out-of-order heartbeat | Sequence numbers discard stale updates |
+| Control-plane restart | State restored + reconciliation sweep |
+
+---
+
+# Observability
+
+Entropy provides:
+
+- `GET /metrics`
+- Structured audit events (`/events`)
+- Worker liveness tracking
+- Queue depth by status
+- Retry & lost counters
+- Completion/failure rate windows
+- Lightweight UI dashboard
+
+---
+
+# Security Model
+
+- Admin vs worker token separation
+- Token rotation support
+- Optional signed worker tokens
+- Optional TLS
+- Optional mTLS
+- Worker command allowlists
+- Working directory allowlists
+- Optional non-root enforcement
+
+---
+
+# Real-World Use Case
+
+Entropy is particularly suited for:
+
+- GPU compute in unstable power environments
+- Local multi-host clusters
+- Home-lab distributed systems
+- Academic distributed scheduling experiments
+- Infrastructure failure simulations
+
+---
+
+# Architecture Overview
+
+![Entropy distributed architecture](assets/entropy-architecture-overview.png)
+
+![Lease and recovery lifecycle](assets/entropy-recovery-transitions.png)
+
+See:
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [DESIGN_GUARANTEES.md](DESIGN_GUARANTEES.md)
+- [SRS.md](SRS.md)
+- [SRS_TEST_SCENARIOS.md](SRS_TEST_SCENARIOS.md)
+
+---
+
+# Design Philosophy
+
+Entropy intentionally avoids:
+
+- Kubernetes
+- Distributed consensus systems
+- External coordination layers
+- Cloud dependencies
+
+It focuses on:
+
+Deterministic state transitions  
+Lease-based safety  
+Durable recovery  
+Minimal moving parts  
+Explicit failure modeling  
+
+---
+
+# Status
+
+Entropy implements the full SRS specification including:
+
+- Lease-based assignment
+- Retry lifecycle
+- Stale worker recovery
+- Concurrency-safe claim logic
+- Stress-tested recovery model
+- Duplicate completion protection
+- Dual-host recovery validation
+
+---
+
+Entropy is not a demo.
+
+It is a small, production-grade distributed systems engine.
