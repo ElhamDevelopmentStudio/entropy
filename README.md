@@ -171,6 +171,7 @@ Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAIL
 ## SRS checklist
 
 - See `SRS_IMPLEMENTATION_CHECKLIST.md` for the full ordered implementation plan and progress tracking.
+- See `EXPANSION_CHECKLIST.md` for the post-SRS roadmap (UI, security, retention, and hardening).
 
 ## SRS recovery test scenarios
 
