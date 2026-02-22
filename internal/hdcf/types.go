@@ -79,6 +79,8 @@ type CreateJobRequest struct {
 	WorkingDir  string   `json:"working_dir"`
 	MaxAttempts int      `json:"max_attempts"`
 	TimeoutMs   int64    `json:"timeout_ms"`
+	Priority    int      `json:"priority"`
+	ScheduledAt int64    `json:"scheduled_at"`
 }
 
 type CreateJobResponse struct {
@@ -100,6 +102,28 @@ type Job struct {
 	ResultPath  string `json:"result_path"`
 }
 
+type JobRead struct {
+	JobID              string   `json:"job_id"`
+	Status             string   `json:"status"`
+	Command            string   `json:"command"`
+	Args               []string `json:"args"`
+	WorkingDir         string   `json:"working_dir"`
+	TimeoutMs          int64    `json:"timeout_ms"`
+	Priority           int      `json:"priority"`
+	ScheduledAt        int64    `json:"scheduled_at"`
+	CreatedAt          int64    `json:"created_at"`
+	UpdatedAt          int64    `json:"updated_at"`
+	AttemptCount       int      `json:"attempt_count"`
+	MaxAttempts        int      `json:"max_attempts"`
+	WorkerID           string   `json:"worker_id"`
+	AssignmentID       string   `json:"assignment_id,omitempty"`
+	AssignmentExpiresAt int64    `json:"assignment_expires_at"`
+	LastError          string   `json:"last_error"`
+	ResultPath         string   `json:"result_path"`
+	UpdatedBy          string   `json:"updated_by"`
+	HeartbeatAgeSec    *int64   `json:"heartbeat_age_sec,omitempty"`
+}
+
 type AssignedJob struct {
 	JobID       string   `json:"job_id"`
 	Command     string   `json:"command"`
@@ -111,6 +135,16 @@ type AssignedJob struct {
 	AssignmentID string  `json:"assignment_id"`
 	// Unix timestamp in seconds. If empty/zero, caller should treat as immediate expiry.
 	AssignmentExpiresAt int64 `json:"assignment_expires_at"`
+}
+
+type WorkerRead struct {
+	WorkerID          string `json:"worker_id"`
+	Status            string `json:"status"`
+	CurrentJobID      string `json:"current_job_id"`
+	LastSeen          int64  `json:"last_seen"`
+	RegisteredAt      int64  `json:"registered_at"`
+	HeartbeatAgeSec   int64  `json:"heartbeat_age_sec"`
+	RegistrationNonce string `json:"registration_nonce"`
 }
 
 type HeartbeatRequest struct {

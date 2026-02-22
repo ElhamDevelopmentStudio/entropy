@@ -60,6 +60,8 @@ func (s *Store) initSchema(ctx context.Context) error {
 		args TEXT NOT NULL,
 		working_dir TEXT,
 		timeout_ms INTEGER NOT NULL DEFAULT 0,
+		priority INTEGER NOT NULL DEFAULT 0,
+		scheduled_at INTEGER NOT NULL DEFAULT 0,
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
 		attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -95,6 +97,9 @@ func (s *Store) initSchema(ctx context.Context) error {
 	if err := s.ensureJobColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureJobIndexes(ctx); err != nil {
+		return err
+	}
 	return s.ensureWorkerColumns(ctx)
 }
 
@@ -128,6 +133,8 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 	need := []columnDef{
 		{name: "assignment_id", ddl: "ALTER TABLE jobs ADD COLUMN assignment_id TEXT"},
 		{name: "assignment_expires_at", ddl: "ALTER TABLE jobs ADD COLUMN assignment_expires_at INTEGER"},
+		{name: "priority", ddl: "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"},
+		{name: "scheduled_at", ddl: "ALTER TABLE jobs ADD COLUMN scheduled_at INTEGER NOT NULL DEFAULT 0"},
 		{name: "artifact_id", ddl: "ALTER TABLE jobs ADD COLUMN artifact_id TEXT"},
 		{name: "artifact_stdout_tmp_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_tmp_path TEXT"},
 		{name: "artifact_stdout_path", ddl: "ALTER TABLE jobs ADD COLUMN artifact_stdout_path TEXT"},
@@ -145,6 +152,11 @@ func (s *Store) ensureJobColumns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) ensureJobIndexes(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_jobs_status_queue_order ON jobs(status, priority DESC, scheduled_at ASC, created_at ASC)")
+	return err
 }
 
 func (s *Store) ensureWorkerColumns(ctx context.Context) error {
@@ -196,24 +208,34 @@ func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.
 	if req.MaxAttempts <= 0 {
 		req.MaxAttempts = 3
 	}
+	now := time.Now().Unix()
+	priority := req.Priority
+	if priority < 0 {
+		priority = 0
+	}
+	scheduledAt := req.ScheduledAt
+	if scheduledAt <= 0 {
+		scheduledAt = now
+	}
 
 	argsJSON, err := json.Marshal(req.Args)
 	if err != nil {
 		return hdcf.CreateJobResponse{}, err
 	}
 
-	now := time.Now().Unix()
 	id := hdcf.NewJobID()
 	_, err = s.db.ExecContext(
 		ctx,
-		`INSERT INTO jobs (id, status, command, args, working_dir, timeout_ms, created_at, updated_at, attempt_count, max_attempts)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+		`INSERT INTO jobs (id, status, command, args, working_dir, timeout_ms, priority, scheduled_at, created_at, updated_at, attempt_count, max_attempts)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
 		id,
 		hdcf.StatusPending,
 		req.Command,
 		string(argsJSON),
 		req.WorkingDir,
 		req.TimeoutMs,
+		priority,
+		scheduledAt,
 		now,
 		now,
 		req.MaxAttempts,
@@ -226,6 +248,213 @@ func (s *Store) CreateJob(ctx context.Context, req hdcf.CreateJobRequest) (hdcf.
 		JobID:  id,
 		Status: hdcf.StatusPending,
 	}, nil
+}
+
+func (s *Store) ListJobs(ctx context.Context, statusFilter, workerIDFilter string) ([]hdcf.JobRead, error) {
+	now := time.Now().Unix()
+	statusFilter = strings.TrimSpace(statusFilter)
+	workerIDFilter = strings.TrimSpace(workerIDFilter)
+
+	query := `
+		SELECT j.id, j.status, j.command, j.args, j.working_dir, j.timeout_ms, j.priority, j.scheduled_at, j.created_at, j.updated_at,
+		       j.attempt_count, j.max_attempts, j.worker_id, j.assignment_id, j.assignment_expires_at,
+		       j.last_error, j.result_path, j.updated_by, w.last_seen
+		FROM jobs j
+		LEFT JOIN workers w ON w.worker_id = j.worker_id
+	`
+	args := []any{}
+	filters := []string{}
+	if statusFilter != "" {
+		filters = append(filters, "j.status = ?")
+		args = append(args, statusFilter)
+	}
+	if workerIDFilter != "" {
+		filters = append(filters, "j.worker_id = ?")
+		args = append(args, workerIDFilter)
+	}
+	if len(filters) > 0 {
+		query += " WHERE " + strings.Join(filters, " AND ")
+	}
+	query += " ORDER BY j.created_at DESC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]hdcf.JobRead, 0, 32)
+	for rows.Next() {
+		var job hdcf.JobRead
+		var argsJSON string
+		var workerID sql.NullString
+		var assignmentID sql.NullString
+		var assignmentExpires sql.NullInt64
+		var workerLastSeen sql.NullInt64
+		if err := rows.Scan(
+			&job.JobID,
+			&job.Status,
+			&job.Command,
+			&argsJSON,
+			&job.WorkingDir,
+			&job.TimeoutMs,
+			&job.Priority,
+			&job.ScheduledAt,
+			&job.CreatedAt,
+			&job.UpdatedAt,
+			&job.AttemptCount,
+			&job.MaxAttempts,
+			&workerID,
+			&assignmentID,
+			&assignmentExpires,
+			&job.LastError,
+			&job.ResultPath,
+			&job.UpdatedBy,
+			&workerLastSeen,
+		); err != nil {
+			return nil, err
+		}
+		if workerID.Valid {
+			job.WorkerID = strings.TrimSpace(workerID.String)
+		}
+		if assignmentID.Valid {
+			job.AssignmentID = assignmentID.String
+		}
+		if assignmentExpires.Valid {
+			job.AssignmentExpiresAt = assignmentExpires.Int64
+		}
+		if job.WorkerID != "" && workerLastSeen.Valid {
+			age := now - workerLastSeen.Int64
+			if age < 0 {
+				age = 0
+			}
+			job.HeartbeatAgeSec = &age
+		}
+		if strings.TrimSpace(argsJSON) != "" {
+			if err := json.Unmarshal([]byte(argsJSON), &job.Args); err != nil {
+				return nil, err
+			}
+		}
+		result = append(result, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *Store) GetJob(ctx context.Context, jobID string) (hdcf.JobRead, bool, error) {
+	now := time.Now().Unix()
+	id := strings.TrimSpace(jobID)
+	if id == "" {
+		return hdcf.JobRead{}, false, nil
+	}
+
+	query := `
+		SELECT j.id, j.status, j.command, j.args, j.working_dir, j.timeout_ms, j.priority, j.scheduled_at, j.created_at, j.updated_at,
+		       j.attempt_count, j.max_attempts, j.worker_id, j.assignment_id, j.assignment_expires_at,
+		       j.last_error, j.result_path, j.updated_by, w.last_seen
+		FROM jobs j
+		LEFT JOIN workers w ON w.worker_id = j.worker_id
+		WHERE j.id = ?
+	`
+	var job hdcf.JobRead
+	var argsJSON string
+	var workerID sql.NullString
+	var assignmentID sql.NullString
+	var assignmentExpires sql.NullInt64
+	var workerLastSeen sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, query, id).Scan(
+		&job.JobID,
+		&job.Status,
+		&job.Command,
+		&argsJSON,
+		&job.WorkingDir,
+		&job.TimeoutMs,
+		&job.Priority,
+		&job.ScheduledAt,
+		&job.CreatedAt,
+		&job.UpdatedAt,
+		&job.AttemptCount,
+		&job.MaxAttempts,
+		&workerID,
+		&assignmentID,
+		&assignmentExpires,
+		&job.LastError,
+		&job.ResultPath,
+		&job.UpdatedBy,
+		&workerLastSeen,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return hdcf.JobRead{}, false, nil
+		}
+		return hdcf.JobRead{}, false, err
+	}
+	if workerID.Valid {
+		job.WorkerID = strings.TrimSpace(workerID.String)
+	}
+	if assignmentID.Valid {
+		job.AssignmentID = assignmentID.String
+	}
+	if assignmentExpires.Valid {
+		job.AssignmentExpiresAt = assignmentExpires.Int64
+	}
+	if job.WorkerID != "" && workerLastSeen.Valid {
+		age := now - workerLastSeen.Int64
+		if age < 0 {
+			age = 0
+		}
+		job.HeartbeatAgeSec = &age
+	}
+	if strings.TrimSpace(argsJSON) != "" {
+		if err := json.Unmarshal([]byte(argsJSON), &job.Args); err != nil {
+			return hdcf.JobRead{}, false, err
+		}
+	}
+	return job, true, nil
+}
+
+func (s *Store) ListWorkers(ctx context.Context) ([]hdcf.WorkerRead, error) {
+	now := time.Now().Unix()
+	query := `
+		SELECT worker_id, last_seen, current_job_id, status, registered_at, registration_nonce
+		FROM workers
+		ORDER BY worker_id
+	`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]hdcf.WorkerRead, 0, 16)
+	for rows.Next() {
+		var w hdcf.WorkerRead
+		var currentJobID sql.NullString
+		if err := rows.Scan(
+			&w.WorkerID,
+			&w.LastSeen,
+			&currentJobID,
+			&w.Status,
+			&w.RegisteredAt,
+			&w.RegistrationNonce,
+		); err != nil {
+			return nil, err
+		}
+		if currentJobID.Valid {
+			w.CurrentJobID = strings.TrimSpace(currentJobID.String)
+		}
+		age := now - w.LastSeen
+		if age < 0 {
+			age = 0
+		}
+		w.HeartbeatAgeSec = age
+		result = append(result, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *Store) IsWorkerRegistered(ctx context.Context, workerID string) (bool, error) {
@@ -307,6 +536,7 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 
 	cutoff := time.Now().Unix() - int64(s.heartbeatTimeout.Seconds())
 	now := time.Now()
+	nowSec := now.Unix()
 	assignmentID := hdcf.NewJobID()
 	assignmentExpiresAt := now.Add(s.heartbeatTimeout).Unix()
 
@@ -316,6 +546,7 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 		FROM jobs
 		WHERE status = ?
 		  AND attempt_count < max_attempts
+		  AND scheduled_at <= ?
 		  AND (
 			worker_id IS NULL
 			OR worker_id = ''
@@ -326,9 +557,10 @@ func (s *Store) ClaimNextJob(ctx context.Context, workerID string) (*hdcf.Assign
 					AND w.last_seen >= ?
 			)
 		  )
-		ORDER BY created_at ASC
+		ORDER BY priority DESC, created_at ASC, id ASC
 		LIMIT 1`,
 		hdcf.StatusPending,
+		nowSec,
 		cutoff,
 	)
 

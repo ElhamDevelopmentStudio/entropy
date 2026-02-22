@@ -185,7 +185,7 @@ Progress:
 - Added `hdcf.AbortRequest` and `store.AbortJobs`.
 - Abort path rejects completed jobs, enforces explicit owner context when `job_id + worker_id` is provided, clears `worker.current_job_id`, and moves jobs to `ABORTED`.
 
-11. `[ ]` P2-11 — Add job read APIs for observability
+11. `[x]` P2-11 — Add job read APIs for observability
 Requirement source: future operations from dashboard optional MVP
 Target: `cmd/control/main.go`, `internal/store/store.go`
 Implementation details:
@@ -194,8 +194,13 @@ Return state, timestamps, attempts, worker id, heartbeat age.
 Acceptance criteria:
 Operators can inspect state of every job and worker after recovery.
 Dependency: P1-08.
+Progress:
+- Added `/jobs` for list (GET) and submit (POST via same handler), with optional `status` and `worker_id` filters.
+- Added `GET /jobs/{id}` returning 404 when missing.
+- Added `GET /workers` with heartbeat age in seconds.
+- Added store read models (`JobRead`, `WorkerRead`) and query methods (`ListJobs`, `GetJob`, `ListWorkers`).
 
-12. `[ ]` P2-12 — Add deterministic queue ordering + optional priority
+12. `[x]` P2-12 — Add deterministic queue ordering + optional priority
 Requirement source: `SRS.md` Section 5.5
 Target: `internal/store/store.go`
 Implementation details:
@@ -204,6 +209,11 @@ Schema add `priority` integer and `scheduled_at`.
 Acceptance criteria:
 Higher priority jobs are scheduled first when defined.
 Dependency: P1-01.
+Progress:
+- Added `priority` and `scheduled_at` columns to job schema plus migration path.
+- `POST /jobs` (`CreateJobRequest`) now accepts `priority` and `scheduled_at`.
+- `GET /next-job` selects eligible `PENDING` jobs by `priority DESC`, then `created_at ASC`, then `id ASC`.
+- Added migration-safe defaults and queue index for deterministic ordering.
 
 13. `[ ]` P2-13 — Add worker capability metadata placeholders
 Requirement source: `SRS.md` Section 5.5

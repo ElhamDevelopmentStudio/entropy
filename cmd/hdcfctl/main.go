@@ -30,7 +30,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("hdcfctl submit --command <command> [--arg A --arg B] [--url=http://localhost:8080] [--token=dev-token]")
+	fmt.Println("hdcfctl submit --command <command> [--arg A --arg B] [--url=http://localhost:8080] [--token=dev-token] [--priority=0] [--scheduled-at=0]")
 }
 
 func submit(args []string) {
@@ -41,6 +41,8 @@ func submit(args []string) {
 	argsCSV := fs.String("args", "", "comma separated args")
 	workingDir := fs.String("working-dir", "", "working directory")
 	maxAttempts := fs.Int("max-attempts", 3, "max attempts")
+	priority := fs.Int("priority", 0, "job priority (higher values run first)")
+	scheduledAt := fs.Int64("scheduled-at", 0, "when job is eligible to run (unix seconds), 0 means now")
 	timeoutMs := fs.Int64("timeout-ms", 0, "command timeout in ms")
 	fs.Parse(args)
 
@@ -52,6 +54,8 @@ func submit(args []string) {
 		Args:        splitArgs(*argsCSV),
 		WorkingDir:  *workingDir,
 		MaxAttempts: *maxAttempts,
+		Priority:    *priority,
+		ScheduledAt: *scheduledAt,
 		TimeoutMs:   *timeoutMs,
 	}
 	payload, err := json.Marshal(request)

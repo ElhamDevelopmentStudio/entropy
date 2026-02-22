@@ -47,10 +47,15 @@ go run ./cmd/hdcfctl submit \
   --url http://<mac-ip>:8080 \
   --token dev-token \
   --command sleep \
-  --args "2"
+  --args "2" \
+  --priority 10
 ```
 
 The CLI sends `POST /jobs` and returns the new `job_id`.
+
+Optional scheduling fields:
+- `--priority` (higher value = higher queue priority)
+- `--scheduled-at` (unix seconds timestamp when job becomes eligible; `0` means now)
 
 ## Implemented endpoints
 
@@ -61,8 +66,21 @@ The CLI sends `POST /jobs` and returns the new `job_id`.
 - `POST /heartbeat`
 - `POST /reconnect`
 - `POST /abort`
+- `GET /jobs` (optional `status` and `worker_id` query filters)
+- `GET /jobs/{job_id}`
+- `GET /workers`
 - `POST /complete`
 - `POST /fail`
+
+Queue ordering behavior:
+- `GET /next-job` claims from `PENDING` jobs by descending `priority`, then ascending `created_at`, then ascending `job_id`.
+- Jobs with `scheduled_at` in the future are not claimed until their scheduled time arrives.
+
+Read/observability behavior:
+
+- `GET /jobs` returns job list entries with state, timestamps, attempt counters, worker assignment, and heartbeat age for jobs with active workers.
+- `GET /jobs/{job_id}` returns a single job detail payload with the same fields.
+- `GET /workers` returns worker rows with heartbeat age in seconds.
 
 Abort behavior:
 
@@ -111,7 +129,7 @@ On startup, the control plane now performs one reconciliation sweep immediately 
 Tables:
 
 - `jobs`:
-  - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `created_at`, `updated_at`,
+  - `id`, `status`, `command`, `args`, `working_dir`, `timeout_ms`, `priority`, `scheduled_at`, `created_at`, `updated_at`,
     `attempt_count`, `max_attempts`, `worker_id`, `assignment_id`, `assignment_expires_at`, `last_error`, `result_path`,
     `artifact_id`, `artifact_stdout_tmp_path`, `artifact_stdout_path`,
     `artifact_stdout_sha256`, `artifact_stderr_tmp_path`, `artifact_stderr_path`,
