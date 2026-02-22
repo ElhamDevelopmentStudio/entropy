@@ -162,8 +162,8 @@ Progress:
 - Added `--url`/`--token` flags across commands and JSON output for list/describe/abort/reconnect responses.
 - Added reconnect replay payload support via `--completed-jobs-file` in `replay`.
 
-10. `[ ]` P5-10 — Integration test suite
-Current status: no automated CI test harness yet
+10. `[~]` P5-10 — Integration test suite
+Current status: unit coverage started; harness framework still pending
 Target: new `tests/` directory
 Implementation tasks:
 - Add unit tests for store transitions and duplicate sequencing.
@@ -171,6 +171,9 @@ Implementation tasks:
 - Add one scripted SRS Section 7 recovery workflow.
 Acceptance criteria:
 - Future refactors cannot silently regress recovery semantics.
+Progress:
+- Added `internal/store/store_test.go` with recovery-focused unit tests for completion idempotency and terminal-noop behavior.
+- Existing `scripts/reliability-scenarios.sh` remains the operational recovery script entrypoint; next step is to add a dedicated automated `tests/` harness and scripted Scenario A-D wrappers.
 
 11. `[ ]` P5-11 — Observability and alerting hooks
 Current status: logs + events only

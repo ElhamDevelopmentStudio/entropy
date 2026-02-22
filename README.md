@@ -318,6 +318,7 @@ Current states in this MVP: `PENDING`, `ASSIGNED`, `RUNNING`, `COMPLETED`, `FAIL
 
 - Section 7 scenarios from `SRS.md` are documented in `SRS_TEST_SCENARIOS.md`.
 - A helper script exists at `scripts/reliability-scenarios.sh` for scenario status checks and duplicate-completion replay.
+- Current automated coverage includes `internal/store/store_test.go` (completion idempotency/noop behavior).
 
 ## UI
 
